@@ -51,7 +51,7 @@ def main():
     parser.add_argument("--speech", type=Path, default=Path(
         "/scratch/mk9649/shared/dcase2026_task5/dataset_copy/libritts/LibriTTS_R/train-clean-100"))
     parser.add_argument("--music", type=Path, default=Path(
-        "/projects/work/marl/datasets/mir_datasets/medleydb_melody"))
+        "/projects/work/marl/sonyc/marl/private_datasets/MedleyDB/Audio"))
     parser.add_argument("--sounds", type=Path, default=Path(
         "/projects/work/marl/datasets/sound_datasets/fsd50k"))
     parser.add_argument("--overwrite", action="store_true")
