@@ -15,3 +15,4 @@ if [[ ! -d external/FlowDec/.git ]]; then
 fi
 git -C external/FlowDec checkout 26ec106281f061a720e0399b0edfd3c3c020d7ab
 python scripts/patch_flowdec.py
+python -m pip check

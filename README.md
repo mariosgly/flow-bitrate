@@ -7,6 +7,7 @@ First ask whether [FlowDec](https://github.com/facebookresearch/FlowDec) needs m
 Use the CUDA 12.6.3 SIF with `/scratch/mg8253/images/flow-matching-50GB.ext3`. After installing Miniforge and `/ext3/env.sh` as discussed, enter the overlay writable. Inside that container, from the repository folder:
 
 ```bash
+source /home/mg8253/.bashrc
 source /ext3/env.sh
 source scripts/scratch.sh
 conda create --prefix /ext3/miniforge3/envs/flow-bitrate python=3.10 pip git -y
@@ -17,7 +18,9 @@ wandb login
 exit
 ```
 
-Exit the writable container before submitting jobs. Jobs mount the overlay read-only, source `/ext3/env.sh`, and activate that exact environment prefix. Copy source files to HPC, not the Mac `.venv`. The editable installation uses the HPC repository path; reinstall if you move it afterward.
+Exit the writable container before submitting jobs. Every job sources `/home/mg8253/.bashrc`, `/ext3/env.sh`, then `scripts/scratch.sh` **inside Singularity**, and activates that exact environment prefix. Nothing sources `.bashrc` on the host. Copy source files to HPC, not the Mac `.venv`. The editable installation uses the HPC repository path; reinstall if you move it afterward.
+
+Setup installs the pinned dependencies (including tests), clones/patches FlowDec, and runs `pip check`. The download script fetches both required checkpoints. No job installs packages, downloads weights, or compiles custom CUDA extensions; first-use caches go to scratch. You still need the audio files and completed manifest. W&B needs network access for online logging; export `WANDB_MODE=offline` before submission otherwise.
 
 Everything generated lives under `/scratch/mg8253/flow-bitrate`: pretrained downloads in `models/`, training checkpoints and reports in `runs/`, measurements/audio in `cache/`, W&B in `wandb/`, Slurm output in `logs/`, and test temporary files in `tmp/`. Configured artifact paths must stay under that project folder. The repository location is independent.
 
@@ -28,7 +31,7 @@ mkdir -p /scratch/mg8253/flow-bitrate/manifests
 cp -n data/diagnostic.example.csv /scratch/mg8253/flow-bitrate/manifests/diagnostic.csv
 ```
 
-Fill in its audio paths. Both configs already use the project scratch folder. Relative paths in those configs resolve there, not into the repository. For interactive commands, source `/ext3/env.sh` followed by `scripts/scratch.sh`, then activate the environment, just as the jobs do.
+Fill in its audio paths. Both configs already use the project scratch folder. Relative paths in those configs resolve there, not into the repository. For interactive commands inside Singularity, use the same sourcing/activation order as setup.
 
 ## First experiment — HPC
 
@@ -36,6 +39,14 @@ Submit from the repository folder under `/scratch`, `/projects`, or `/home`. Its
 
 ```bash
 mkdir -p /scratch/mg8253/flow-bitrate/logs
+sbatch slurm/initial.slurm
+```
+
+This requests **one GPU, four CPUs, 32 GB host RAM, and 24 hours**, with no array. It runs the full rate/computation grid, then oracle analysis in the same job. It asks whether extra bits or extra flow evaluations help, and whether placing bits differently helps under the same budget. Completed recordings are reused if you resubmit after a timeout. Optional: pass `--config configs/another.json`.
+
+For parallel recordings instead (each array task uses one GPU):
+
+```bash
 grid_job=$(sbatch --parsable slurm/diagnostic.slurm)
 sbatch --dependency=afterok:"$grid_job" slurm/oracle.slurm
 ```

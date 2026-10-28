@@ -11,7 +11,7 @@ from flow_bitrate.metrics import spectral_loss
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default=ROOT / "configs/experiment.json")
+    parser.add_argument("--config", default=ROOT / "configs/diagnostic.json")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
     config = load_config(args.config)
@@ -26,7 +26,7 @@ def main():
         for depth in CODEBOOKS:
             coarse, _ = codec.coarse(codes, depth)
             probes = codec.probes(original, coarse, seed=1)
-            decoded = codec.enhance(coarse, seed=1, steps=config["steps"])
+            decoded = codec.enhance(coarse, seed=1, steps=config.get("steps", 3))
             assert decoded.shape == original.shape and torch.isfinite(probes).all()
             print(f"{depth} codebooks: loss={spectral_loss(original, decoded).item():.4f}", flush=True)
     codec.train()

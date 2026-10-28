@@ -18,4 +18,4 @@ FLOW_OVERLAY="${FLOW_OVERLAY:-/scratch/mg8253/images/flow-matching-50GB.ext3}"
 export FLOW_BITRATE_ENV="${FLOW_BITRATE_ENV:-/ext3/miniforge3/envs/flow-bitrate}"
 srun --kill-on-bad-exit=1 singularity exec --nv --fakeroot --overlay "${FLOW_OVERLAY}:ro" \
   --bind /home:/home --bind /scratch:/scratch --bind /projects:/projects \
-  "$FLOW_IMAGE" bash slurm/worker.sh "$@"
+  "$FLOW_IMAGE" bash --noprofile --norc slurm/worker.sh "$@"

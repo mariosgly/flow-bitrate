@@ -2,6 +2,16 @@
 
 Start with about **30 recordings: 10 speech, 10 music, 10 everyday/environmental sounds**. This is a pilot, not a final benchmark. Use different speakers, songs and recording sources where possible.
 
+For the shared HPC collections, run this inside Singularity with the project environment active (no GPU needed):
+
+```bash
+python scripts/make_manifest.py
+```
+
+Defaults search the shared LibriTTS-R `train-clean-100`, `/projects/work/marl/datasets/mir_datasets/medleydb_melody`, and `/projects/work/marl/datasets/sound_datasets/fsd50k`. Override paths with `--speech`, `--music`, or `--sounds`. It chooses ten different speakers, MedleyDB artists (full `*_MIX` files only), and FSD50K uploaders, with at least ten seconds plus a small rounding margin. Excerpts start near the recording's middle; unreadable, nonfinite, and effectively silent excerpts are skipped. Selection is seeded from the diagnostic config; no audio is copied and no packages are installed.
+
+The script needs extracted WAV/FLAC files and FSD50K's extracted `dev_clips_info_FSD50K.json` and/or `eval_clips_info_FSD50K.json` somewhere under its sound root. It stops without writing a partial manifest if any domain has fewer than ten eligible sources. The output comes from `configs/diagnostic.json`; use `--overwrite` to replace an existing manifest. Use a fresh diagnostic cache if changing an already measured manifest. Automatic selection does not ensure event/genre balance or exclude speech/music events from FSD50K; inspect the selected examples before treating the pilot as a benchmark.
+
 - Speech: original VCTK or EARS recordings, at least two seconds long. Short utterances still test rates/steps.
 - Music: MUSDB18-**HQ** `mixture.wav` files. No stems needed. Pick a representative section with `start_seconds`.
 - Sounds: original FSD50K WAVs, preferably at least ten seconds long. Include impacts, tonal sounds and textures.
