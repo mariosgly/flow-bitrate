@@ -1,0 +1,4 @@
+path,split,group
+/scratch/mg8253/audio/train.wav,train,recording_001
+/scratch/mg8253/audio/val.wav,val,recording_002
+/scratch/mg8253/audio/test.wav,test,recording_003

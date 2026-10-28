@@ -1,0 +1,14 @@
+{
+  "manifest": "data/manifest.csv",
+  "checkpoints": "checkpoints",
+  "flow_checkpoint": null,
+  "cache": "cache/pretrained",
+  "output": "runs",
+  "wandb_project": "flow-bitrate",
+  "seed": 42,
+  "sample_seeds": [0, 1],
+  "steps": 3,
+  "budget_kbps": 4.55,
+  "allocator": {"batch_size": 256, "workers": 0, "epochs": 50, "lr": 0.0003},
+  "flow": {"batch_size": 2, "workers": 4, "epochs": 10, "lr": 0.00001, "accumulate": 4}
+}

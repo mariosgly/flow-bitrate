@@ -1,0 +1,4 @@
+path,split,group,domain,start_seconds
+/scratch/mg8253/audio/speech/speaker01/utterance.wav,val,speaker01,speech,0
+/scratch/mg8253/audio/music/song01/mixture.wav,val,song01,music,30
+/scratch/mg8253/audio/sounds/recording01.wav,val,uploader01,sound,0

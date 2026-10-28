@@ -1,0 +1,20 @@
+{
+  "name": "initial-grid",
+  "manifest": "data/diagnostic.csv",
+  "checkpoints": "checkpoints",
+  "flow_checkpoint": null,
+  "cache": "cache/initial-grid",
+  "output": "runs",
+  "wandb_project": "flow-bitrate",
+  "split": "val",
+  "seed": 42,
+  "nfe": [2, 6, 12, 24, 48],
+  "reference_nfe": 96,
+  "selection_seeds": [0, 1],
+  "evaluation_seeds": [2, 3],
+  "max_seconds_per_file": 10,
+  "min_oracle_blocks": 5,
+  "budgets_kbps": [4.55, 6.05],
+  "shuffle_repeats": 50,
+  "audio_files_per_domain": 1
+}
