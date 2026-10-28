@@ -10,6 +10,7 @@ import yaml
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRATCH = Path("/scratch/mg8253/flow-bitrate")
 UPSTREAM = ROOT / "external/FlowDec"
 SAMPLE_RATE = 48_000
 BLOCK_SAMPLES = 96_000

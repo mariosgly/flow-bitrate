@@ -9,15 +9,12 @@
 #SBATCH --time=12:00:00
 #SBATCH --signal=USR1@180
 #SBATCH --requeue
-#SBATCH --output=/scratch/mg8253/logs/%x-%j.out
-#SBATCH --error=/scratch/mg8253/logs/%x-%j.err
+#SBATCH --output=/scratch/mg8253/flow-bitrate/logs/%x-%j.out
+#SBATCH --error=/scratch/mg8253/flow-bitrate/logs/%x-%j.err
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
-export WANDB_DIR="${WANDB_DIR:-/scratch/mg8253/flow-bitrate/wandb}"
-export MPLCONFIGDIR="/scratch/mg8253/flow-bitrate/matplotlib"
-mkdir -p "$WANDB_DIR" "$MPLCONFIGDIR"
 FLOW_IMAGE="${FLOW_IMAGE:-/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif}"
 FLOW_OVERLAY="${FLOW_OVERLAY:-/scratch/mg8253/images/flow-matching-50GB.ext3}"
 export FLOW_BITRATE_ENV="${FLOW_BITRATE_ENV:-/ext3/miniforge3/envs/flow-bitrate}"

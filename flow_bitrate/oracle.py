@@ -182,7 +182,7 @@ def main():
     for name, values in (("grid", grid), ("measurements", measurements), ("effects", effects), ("oracle", oracles)):
         write_csv(output / f"{name}.csv", values)
     with wandb.init(project=config["wandb_project"], name=f"{config['name']}-oracle", group=config["name"],
-                    job_type="diagnostic-analysis", config=config) as run:
+                    job_type="diagnostic-analysis", dir=config["wandb_dir"], config=config) as run:
         for name, values in summary.items():
             if values:
                 columns = list(values[0])

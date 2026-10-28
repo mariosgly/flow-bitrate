@@ -34,3 +34,4 @@ packages = ["flow_bitrate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+cache_dir = "/scratch/mg8253/flow-bitrate/cache/pytest"

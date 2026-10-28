@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from flow_bitrate.train import RatePredictor
+from flow_bitrate.codec import SCRATCH
 
 
 def main():
@@ -16,7 +17,8 @@ def main():
     x = torch.randn(32, 12)
     loader = DataLoader(TensorDataset(x, x[:, :4].square().log1p()), batch_size=8)
     model = RatePredictor([0.] * 12, [1.] * 12, base_dim=8)
-    with tempfile.TemporaryDirectory() as directory:
+    (SCRATCH / "tmp").mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=SCRATCH / "tmp") as directory:
         trainer = pl.Trainer(accelerator="cpu", devices=2, strategy="ddp_spawn", max_epochs=1,
                              logger=False, default_root_dir=directory, enable_checkpointing=False,
                              enable_progress_bar=False, enable_model_summary=False, num_sanity_val_steps=0)

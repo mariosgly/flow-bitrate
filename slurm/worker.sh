@@ -1,10 +1,9 @@
 #!/bin/bash
 set -eo pipefail
 source /ext3/env.sh
+source scripts/scratch.sh
 conda activate "${FLOW_BITRATE_ENV:-/ext3/miniforge3/envs/flow-bitrate}"
 set -u
-export TMPDIR="/scratch/mg8253/flow-bitrate/tmp/${SLURM_JOB_ID}/${SLURM_PROCID:-0}"
-mkdir -p "$TMPDIR"
 task="$1"
 shift
 if [[ "$task" == train ]]; then

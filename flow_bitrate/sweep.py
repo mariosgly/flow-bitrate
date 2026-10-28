@@ -85,7 +85,7 @@ def main():
         counts[row["domain"]] += 1
     warmed_up = False
     with wandb.init(project=config["wandb_project"], name=f"{config['name']}-shard{args.shard}",
-                    group=config["name"], job_type="diagnostic-sweep", config=config) as run:
+                    group=config["name"], job_type="diagnostic-sweep", dir=config["wandb_dir"], config=config) as run:
         for index in tqdm(range(args.shard, len(rows), args.num_shards), desc="recordings"):
             row = rows[index]
             source = Path(row["path"])

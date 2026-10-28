@@ -9,16 +9,21 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRATCH = Path("/scratch/mg8253/flow-bitrate")
 URL = "https://github.com/facebookresearch/FlowDec/releases/download/checkpoints/checkpoints.zip"
 FILES = ["ndac/ndac-75/800k/dac/weights.pth", "flowdec/flowdec_75m/step=800000.ckpt"]
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, default=ROOT / "configs/diagnostic.json")
     parser.add_argument("--archive", type=Path)
     args = parser.parse_args()
-    root = ROOT / "checkpoints"
-    root.mkdir(exist_ok=True)
+    config = json.loads(args.config.read_text())
+    root = (SCRATCH / config["checkpoints"]).resolve()
+    if not root.is_relative_to(SCRATCH.resolve()):
+        raise ValueError("Model downloads must stay under /scratch/mg8253/flow-bitrate")
+    root.mkdir(parents=True, exist_ok=True)
     archive = args.archive or root / "checkpoints.zip"
     if not archive.exists():
         if args.archive:

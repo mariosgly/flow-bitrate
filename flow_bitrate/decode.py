@@ -7,7 +7,7 @@ import soundfile as sf
 import torch
 
 from .allocation import unpack_codes
-from .codec import BLOCK_SAMPLES, CODEBOOKS, ROOT, SAMPLE_RATE, FlowCodec
+from .codec import BLOCK_SAMPLES, CODEBOOKS, ROOT, SAMPLE_RATE, SCRATCH, FlowCodec
 from .data import load_config
 from .prepare import block_seed
 
@@ -20,6 +20,10 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     config = load_config(args.config)
+    output = (Path(config["output"]) / args.output).resolve()
+    if not output.is_relative_to(SCRATCH.resolve()):
+        raise ValueError(f"Decoded audio must be written under {SCRATCH}")
+    output.parent.mkdir(parents=True, exist_ok=True)
     codes, choices, seed = unpack_codes(args.input.read_bytes())
     codec = FlowCodec(config["checkpoints"], config.get("flow_checkpoint")).to(args.device).requires_grad_(False)
     audio = []
@@ -29,7 +33,7 @@ def main():
             coarse = codec.coarse(code, CODEBOOKS[choice])[0]
             decoded = codec.enhance(coarse, block_seed("", index * BLOCK_SAMPLES, seed), config["steps"])
             audio.append(decoded[0, 0].cpu())
-    sf.write(args.output, torch.cat(audio).numpy(), SAMPLE_RATE, subtype="FLOAT")
+    sf.write(output, torch.cat(audio).numpy(), SAMPLE_RATE, subtype="FLOAT")
 
 
 if __name__ == "__main__":

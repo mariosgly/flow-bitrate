@@ -9,14 +9,19 @@ import torch
 import torchaudio.functional as AF
 from torch.utils.data import Dataset
 
-from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, file_hash
+from .codec import BLOCK_SAMPLES, SAMPLE_RATE, SCRATCH, file_hash
 
 
 def load_config(path):
     config = json.loads(Path(path).read_text())
-    for key in ("manifest", "checkpoints", "cache", "output", "flow_checkpoint"):
+    config.setdefault("wandb_dir", str(SCRATCH / "wandb"))
+    for key in ("manifest", "checkpoints", "cache", "output", "flow_checkpoint", "wandb_dir"):
         if config.get(key):
-            config[key] = str((ROOT / config[key]).resolve())
+            resolved = (SCRATCH / config[key]).resolve()
+            if key in {"checkpoints", "cache", "output", "wandb_dir"} and not resolved.is_relative_to(SCRATCH.resolve()):
+                raise ValueError(f"{key} must be under {SCRATCH}")
+            config[key] = str(resolved)
+    Path(config["wandb_dir"]).mkdir(parents=True, exist_ok=True)
     return config
 
 

@@ -132,7 +132,7 @@ def main():
     logger = False
     if not args.smoke:
         logger = WandbLogger(project=config["wandb_project"], name=args.name, id=run_id,
-                             resume="allow", save_dir=config["output"], log_model=False)
+                             resume="allow", save_dir=config["wandb_dir"], log_model=False)
         logger.log_hyperparams({"experiment": config, "cli": vars(args)})
     callback = ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/loss", mode="min",
                                save_last=True, save_top_k=1)

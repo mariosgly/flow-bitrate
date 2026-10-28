@@ -10,13 +10,13 @@ Use recordings you consider suitable references. WAV/PCM does not by itself mean
 
 The reader averages stereo to mono and resamples to 48 kHz. The default takes up to **ten seconds** from each listed offset and drops the final partial two-second block. Allocation needs **five full blocks** by default: shorter excerpts enter the rate/compute grid, but are excluded from the oracle. Make sure you have enough long music/sound excerpts. Resampling does not restore missing bandwidth.
 
-Copy `diagnostic.example.csv` to `diagnostic.csv`:
+Copy `data/diagnostic.example.csv` to `/scratch/mg8253/flow-bitrate/manifests/diagnostic.csv` and fill it in:
 
 ```csv
 path,split,group,domain,start_seconds
-/scratch/mg8253/audio/speech/a.wav,val,speaker_01,speech,0
-/scratch/mg8253/audio/music/song/mixture.wav,val,song_01,music,30
-/scratch/mg8253/audio/sounds/b.wav,val,uploader_01,sound,0
+/scratch/mg8253/flow-bitrate/audio/speech/a.wav,val,speaker_01,speech,0
+/scratch/mg8253/flow-bitrate/audio/music/song/mixture.wav,val,song_01,music,30
+/scratch/mg8253/flow-bitrate/audio/sounds/b.wav,val,uploader_01,sound,0
 ```
 
 Paths must exist **inside the Slurm container**. Group by speaker/song/uploader when examples share that source. Keep this exploratory set in `val`; no training split is needed yet. Reserve other recordings for later confirmation. Check pretrained-data overlap before claiming unseen-data results.
@@ -24,8 +24,8 @@ Paths must exist **inside the Slurm container**. Group by speaker/song/uploader 
 Also place the official weights at:
 
 ```text
-checkpoints/ndac/ndac-75/800k/dac/weights.pth
-checkpoints/flowdec/flowdec_75m/step=800000.ckpt
+/scratch/mg8253/flow-bitrate/models/ndac/ndac-75/800k/dac/weights.pth
+/scratch/mg8253/flow-bitrate/models/flowdec/flowdec_75m/step=800000.ckpt
 ```
 
-`scripts/download_models.py` installs those from the official archive. Download on HPC before submitting GPU jobs; compute nodes need no download access. Point the diagnostic config at scratch locations for the manifest, checkpoints, cache and outputs.
+`scripts/download_models.py` reads the diagnostic config and downloads/extracts into its `checkpoints` directory, already set to the scratch `models/` folder. Download on HPC before submitting GPU jobs; compute nodes need no download access. Existing datasets may stay at other readable locations; all generated outputs stay in the project scratch folder.

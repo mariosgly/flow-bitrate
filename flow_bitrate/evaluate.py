@@ -140,7 +140,8 @@ def main():
               "note": "Cached losses average sampling seeds. WAVs use only the first seed. Blocks reset independently."}
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     (output / "choices.json").write_text(json.dumps(choices_to_save, indent=2) + "\n")
-    with wandb.init(project=config["wandb_project"], name=args.name, job_type="evaluation", config=config) as run:
+    with wandb.init(project=config["wandb_project"], name=args.name, job_type="evaluation",
+                    dir=config["wandb_dir"], config=config) as run:
         run.log({f"{method}/{metric}": value for method, values in summary.items()
                  for metric, value in values.items() if isinstance(value, (int, float))})
     print(json.dumps(summary, indent=2))
