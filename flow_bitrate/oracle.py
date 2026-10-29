@@ -179,6 +179,7 @@ def main():
                   "NMSE to reference uses original waveform power; reference-to-itself is zero by construction.",
                   "Decoder RTF includes RVQ reconstruction and flow, excludes encoder/I/O/metrics; GPU warmup excluded.",
                   "Independent mono two-second blocks; tails dropped. Metrics do not establish perceptual quality.",
+                  "NDAC output is right-zero-padded/cropped to 96000 samples before flow and metrics; policy is in codec identity.",
               ]}
     for name, values in (("grid", grid), ("measurements", measurements), ("effects", effects), ("oracle", oracles)):
         write_csv(output / f"{name}.csv", values)

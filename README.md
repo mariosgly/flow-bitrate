@@ -50,7 +50,7 @@ For **two-hour slices on one GPU**, use this instead, and rerun the same command
 sbatch slurm/initial_2h.slurm
 ```
 
-The sweep stops near 1h55m, after saving its current solve, leaving a small margin before Slurm's limit. A cleanly completed Slurm slice can still mean there is work left; its log says whether to resubmit. Once the grid is complete, the job runs the oracle and writes `runs/initial-grid/summary.json` under project scratch. If killed during analysis, rerun the same job; inference is already cached and analysis is repeated. No reinstall is needed after copying the updated Python/Slurm files.
+Each initial job first checks one real recording with the released weights at all four rates, including both decoder paths, waveform lengths, spectral loss/SI-SDR, and flow reconstruction. It aborts before the grid if this fails. The two-hour job includes that preflight in its 1h55m sweep budget, leaving a small margin before Slurm's limit. A cleanly completed Slurm slice can still mean there is work left; its log says whether to resubmit. Once the grid is complete, the job runs the oracle and writes `runs/initial-grid/summary.json` under project scratch. If killed during analysis, rerun the same job; inference is already cached and analysis is repeated. No reinstall is needed after copying the updated Python/Slurm files.
 
 Each completed reconstruction is checkpointed, including the active high-NFE reference, with flush/fsync and atomic replacement. Hard kills can lose the solve currently running (plus inexpensive setup), but not previously committed solves on a functioning filesystem. Partial `.part` writes are ignored. Listening audio is saved in per-block pieces and assembled at completion. Record locks prevent overlapping jobs from writing the same record. Do not change the manifest, weights, or measurement settings while resuming: their hashes are checked. Existing completed recording caches remain usable. Submit the next slice after the previous job has stopped; no manual checkpoint selection is needed. Reports are also written atomically; `summary.json` is published after all report CSVs.
 
@@ -68,6 +68,8 @@ Results: `/scratch/mg8253/flow-bitrate/runs/initial-grid/summary.json` and `grid
 The oracle compares uniform rates, the best constant rate, and per-block allocation under a file budget including headers/flags/padding. Shuffling its assignments preserves the same rate histogram and tests whether placement matters. Positive gains mean lower spectral error; intervals resample independent groups. The oracle sees the original, so it is a diagnostic, not a deployable allocator.
 
 A 96-evaluation solve is **not guaranteed converged**: inspect the 48-to-96 change. Waveform NMSE to that reference estimates numerical disagreement, not fidelity to the original. Spectral loss/SI-SDR do not prove perceptual quality. Listen to the examples, including joins between independent two-second blocks.
+
+NDAC outputs are right-zero-padded or cropped to exactly 96,000 samples before flow reconstruction and scoring; odd decoder strides can otherwise leave a few samples missing. Differences of a full codec hop or more are rejected. This is our fixed-block boundary policy, recorded in the codec identity so caches from an older policy cannot be mixed. Metrics require equal shapes and do not silently crop the reference.
 
 ## Later — only if the diagnostic supports it
 

@@ -3,6 +3,8 @@ import torch
 
 def spectral_loss(original, reconstructed):
     """Mean log-magnitude error, three resolutions; one value per block."""
+    if original.shape != reconstructed.shape:
+        raise ValueError(f"Spectral loss needs equal waveform shapes: {original.shape} vs {reconstructed.shape}")
     original, reconstructed = original.flatten(0, 1), reconstructed.flatten(0, 1)
     losses = []
     for size in (256, 1024, 4096):
@@ -14,6 +16,8 @@ def spectral_loss(original, reconstructed):
 
 
 def si_sdr(original, reconstructed):
+    if original.shape != reconstructed.shape:
+        raise ValueError(f"SI-SDR needs equal waveform shapes: {original.shape} vs {reconstructed.shape}")
     x, y = original.flatten(1), reconstructed.flatten(1)
     x, y = x - x.mean(1, keepdim=True), y - y.mean(1, keepdim=True)
     projection = (x * y).sum(1, keepdim=True) / x.square().sum(1, keepdim=True).clamp_min(1e-8) * x

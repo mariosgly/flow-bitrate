@@ -20,12 +20,20 @@ elif [[ "$task" == evaluate ]]; then
 elif [[ "$task" == diagnostic ]]; then
   exec python -m flow_bitrate.sweep --device cuda "$@"
 elif [[ "$task" == initial ]]; then
+  python scripts/smoke_codec.py --device cuda --inference-only "$@"
   # Separate processes release GPU memory before the CPU-only analysis.
   python -m flow_bitrate.sweep --device cuda --shard 0 --num-shards 1 "$@"
   exec python -m flow_bitrate.oracle "$@"
 elif [[ "$task" == initial-resumable ]]; then
+  slice_started=$SECONDS
+  python scripts/smoke_codec.py --device cuda --inference-only "$@"
+  remaining=$((6900 - SECONDS + slice_started))
+  if (( remaining <= 0 )); then
+    echo "Preflight used this slice's time budget; rerun the job to continue."
+    exit 0
+  fi
   status=0
-  python -m flow_bitrate.sweep --device cuda --shard 0 --num-shards 1 --max-seconds 6900 "$@" || status=$?
+  python -m flow_bitrate.sweep --device cuda --shard 0 --num-shards 1 --max-seconds "$remaining" "$@" || status=$?
   if [[ "$status" == 75 ]]; then
     echo "This two-hour slice is done; the experiment is not finished yet."
     echo "Rerun sbatch slurm/initial_2h.slurm with the same config to continue."

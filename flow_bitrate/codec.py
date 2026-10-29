@@ -71,7 +71,8 @@ class FlowCodec(nn.Module):
         self.register_buffer("sigma", state["sigma_y"].float())
         if tuple(self.sigma.shape) not in {(768, 1), ()}:
             raise ValueError(f"Unexpected sigma shape: {self.sigma.shape}")
-        self.identity = {"ndac": file_hash(ndac_path), "flow": file_hash(flow_path)}
+        self.identity = {"ndac": file_hash(ndac_path), "flow": file_hash(flow_path),
+                         "waveform_policy": "right-zero-pad-or-crop-to-96000-v1"}
         self.ndac.requires_grad_(False)
         self.features.requires_grad_(False)
         self.eval()
@@ -85,17 +86,29 @@ class FlowCodec(nn.Module):
     @torch.no_grad()
     def encode(self, audio):
         # audio [B, 1, 96000], latent [B, 1024, 150], codes [B, 10, 150]
+        if audio.ndim != 3 or audio.shape[1:] != (1, BLOCK_SAMPLES):
+            raise ValueError(f"Expected audio [B, 1, {BLOCK_SAMPLES}], got {tuple(audio.shape)}")
         audio = self.ndac.preprocess(audio, SAMPLE_RATE)
         latent = self.ndac.encoder(audio)
         _, codes, _, _, _ = self.ndac.quantizer(latent, n_quantizers=10)
-        if latent.shape[1] != 1024 or codes.shape[1] != 10:
+        if latent.shape[1] != 1024 or codes.shape[1:] != (10, 150):
             raise ValueError("This experiment expects the NDAC-75 checkpoint")
         return latent, codes
+
+    def _decode_block(self, quantized):
+        waveform = self.ndac.decode(quantized)
+        missing = BLOCK_SAMPLES - waveform.shape[-1]
+        # Odd transposed-convolution strides can leave a short tail. Cropping alone
+        # cannot restore it. All rates use the same fixed two-second output policy.
+        if quantized.shape[-1] != 150 or abs(missing) >= int(self.ndac.hop_length):
+            raise ValueError(f"Unexpected NDAC output: {quantized.shape[-1]} frames -> "
+                             f"{waveform.shape[-1]} samples; expected near {BLOCK_SAMPLES}")
+        return F.pad(waveform, (0, max(missing, 0)))[..., :BLOCK_SAMPLES]
 
     @torch.no_grad()
     def coarse(self, codes, codebooks):
         quantized, _, _ = self.ndac.quantizer.from_codes(codes[:, :codebooks])
-        return self.ndac.decode(quantized)[..., :BLOCK_SAMPLES], quantized
+        return self._decode_block(quantized), quantized
 
     @torch.no_grad()
     def coarse_at_rates(self, codes, rate):
@@ -103,10 +116,12 @@ class FlowCodec(nn.Module):
         candidates = torch.stack([self.ndac.quantizer.from_codes(codes[:, :k])[0] for k in CODEBOOKS], 1)
         batch, _, channels, frames = candidates.shape
         quantized = candidates.gather(1, rate[:, None, None, None].expand(batch, 1, channels, frames)).squeeze(1)
-        return self.ndac.decode(quantized)[..., :BLOCK_SAMPLES]
+        return self._decode_block(quantized)
 
     def preprocess(self, coarse, original=None):
         # Complex STFTs [B, 1, 768, frames], padded to a multiple of 64 frames.
+        if original is not None and original.shape != coarse.shape:
+            raise ValueError(f"Flow target/condition shapes differ: {original.shape} vs {coarse.shape}")
         scale = coarse.abs().amax(dim=(1, 2), keepdim=True)
         scale = torch.where(torch.isclose(scale, torch.zeros_like(scale)), 1.0, scale)
         condition = self.features(coarse.float() / scale)
