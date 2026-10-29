@@ -44,6 +44,16 @@ sbatch slurm/initial.slurm
 
 This requests **one GPU, four CPUs, 32 GB host RAM, and 24 hours**, with no array. It runs the full rate/computation grid, then oracle analysis in the same job. It asks whether extra bits or extra flow evaluations help, and whether placing bits differently helps under the same budget. Completed recordings are reused if you resubmit after a timeout. Optional: pass `--config configs/another.json`.
 
+For **two-hour slices on one GPU**, use this instead, and rerun the same command until the experiment finishes:
+
+```bash
+sbatch slurm/initial_2h.slurm
+```
+
+The sweep stops near 1h55m, after saving its current solve, leaving a small margin before Slurm's limit. A cleanly completed Slurm slice can still mean there is work left; its log says whether to resubmit. Once the grid is complete, the job runs the oracle and writes `runs/initial-grid/summary.json` under project scratch. If killed during analysis, rerun the same job; inference is already cached and analysis is repeated. No reinstall is needed after copying the updated Python/Slurm files.
+
+Each completed reconstruction is checkpointed, including the active high-NFE reference, with flush/fsync and atomic replacement. Hard kills can lose the solve currently running (plus inexpensive setup), but not previously committed solves on a functioning filesystem. Partial `.part` writes are ignored. Listening audio is saved in per-block pieces and assembled at completion. Record locks prevent overlapping jobs from writing the same record. Do not change the manifest, weights, or measurement settings while resuming: their hashes are checked. Existing completed recording caches remain usable. Submit the next slice after the previous job has stopped; no manual checkpoint selection is needed. Reports are also written atomically; `summary.json` is published after all report CSVs.
+
 For parallel recordings instead (each array task uses one GPU):
 
 ```bash

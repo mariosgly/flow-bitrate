@@ -23,6 +23,17 @@ elif [[ "$task" == initial ]]; then
   # Separate processes release GPU memory before the CPU-only analysis.
   python -m flow_bitrate.sweep --device cuda --shard 0 --num-shards 1 "$@"
   exec python -m flow_bitrate.oracle "$@"
+elif [[ "$task" == initial-resumable ]]; then
+  status=0
+  python -m flow_bitrate.sweep --device cuda --shard 0 --num-shards 1 --max-seconds 6900 "$@" || status=$?
+  if [[ "$status" == 75 ]]; then
+    echo "This two-hour slice is done; the experiment is not finished yet."
+    echo "Rerun sbatch slurm/initial_2h.slurm with the same config to continue."
+    exit 0
+  elif [[ "$status" != 0 ]]; then
+    exit "$status"
+  fi
+  exec python -m flow_bitrate.oracle "$@"
 elif [[ "$task" == oracle ]]; then
   exec python -m flow_bitrate.oracle "$@"
 elif [[ "$task" == check ]]; then

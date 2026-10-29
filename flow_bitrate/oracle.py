@@ -13,7 +13,7 @@ import wandb
 from .allocation import allocate, stream_bits, uniform_choices
 from .codec import CODEBOOKS, ROOT
 from .data import load_config
-from .sweep import diagnostic_rows, sweep_settings
+from .sweep import commit_file, diagnostic_rows, sweep_settings
 
 
 def group_values(rows, key):
@@ -33,13 +33,15 @@ def interval(values, seed):
 
 
 def write_csv(path, rows):
+    temporary = path.with_suffix(path.suffix + ".part")
     if rows:
-        with path.open("w", newline="") as handle:
+        with temporary.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
     else:
-        path.write_text("")
+        temporary.write_text("")
+    commit_file(temporary, path)
 
 
 def main():
@@ -178,9 +180,11 @@ def main():
                   "Decoder RTF includes RVQ reconstruction and flow, excludes encoder/I/O/metrics; GPU warmup excluded.",
                   "Independent mono two-second blocks; tails dropped. Metrics do not establish perceptual quality.",
               ]}
-    (output / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     for name, values in (("grid", grid), ("measurements", measurements), ("effects", effects), ("oracle", oracles)):
         write_csv(output / f"{name}.csv", values)
+    temporary = output / "summary.json.part"
+    temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    commit_file(temporary, output / "summary.json")
     with wandb.init(project=config["wandb_project"], name=f"{config['name']}-oracle", group=config["name"],
                     job_type="diagnostic-analysis", dir=config["wandb_dir"], config=config) as run:
         for name, values in summary.items():
