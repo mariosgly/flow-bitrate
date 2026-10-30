@@ -54,12 +54,15 @@ Each initial job first checks one real recording with the released weights at al
 
 Each completed reconstruction is checkpointed, including the active high-NFE reference, with flush/fsync and atomic replacement. Hard kills can lose the solve currently running (plus inexpensive setup), but not previously committed solves on a functioning filesystem. Partial `.part` writes are ignored. Listening audio is saved in per-block pieces and assembled at completion. Record locks prevent overlapping jobs from writing the same record. Do not change the manifest, weights, or measurement settings while resuming: their hashes are checked. Existing completed recording caches remain usable. Submit the next slice after the previous job has stopped; no manual checkpoint selection is needed. Reports are also written atomically; `summary.json` is published after all report CSVs.
 
-For parallel recordings instead (each array task uses one GPU):
+For **40-minute jobs with no array concurrency cap**, use the array for the current 30-recording manifest:
 
 ```bash
-grid_job=$(sbatch --parsable slurm/diagnostic.slurm)
-sbatch --dependency=afterok:"$grid_job" slurm/oracle.slurm
+sbatch slurm/diagnostic_40m.slurm
+# After every recording finishes:
+sbatch slurm/oracle.slurm
 ```
+
+There are 30 tasks, each assigned one recording, with no script-imposed concurrency limit; actual concurrency depends on Slurm availability and account limits. Each requests one GPU, four CPUs, 32 GB RAM, and 40 minutes; the sweep stops near 35 minutes if unfinished. Existing completed recordings are skipped and partial recordings resume from the same cache. Stop/wait for the old job before switching. Rerun the array if needed; an unfinished task exits 75 rather than reporting success. For a subset retry, `sbatch --array=4,7,12 slurm/diagnostic_40m.slurm` keeps the original recording assignments. This changes scheduling, not the experiment. The older four-shard `diagnostic.slurm` is still available. No reinstall is needed.
 
 The grid measures 4/6/8/10 codebooks at 2/6/12/24/48 evaluations, plus a 96-evaluation numerical reference and NDAC-only baseline. Same noise across budgets; two seeds for oracle selection and two separate seeds for evaluation. The sweep resumes completed recordings automatically. Pass `--config` to both jobs for another config; use a new cache if measurement settings change.
 
