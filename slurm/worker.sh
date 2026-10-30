@@ -44,6 +44,8 @@ elif [[ "$task" == initial-resumable ]]; then
   exec python -m flow_bitrate.oracle "$@"
 elif [[ "$task" == oracle ]]; then
   exec python -m flow_bitrate.oracle "$@"
+elif [[ "$task" == listen ]]; then
+  exec python -m flow_bitrate.listen --device cuda "$@"
 elif [[ "$task" == check ]]; then
   python -m pytest -q
   exec python scripts/smoke_codec.py --device cuda "$@"

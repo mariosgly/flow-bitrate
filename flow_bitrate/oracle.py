@@ -13,6 +13,7 @@ import wandb
 from .allocation import allocate, stream_bits, uniform_choices
 from .codec import CODEBOOKS, ROOT
 from .data import load_config
+from .plots import plot_report
 from .sweep import commit_file, diagnostic_rows, sweep_settings
 
 
@@ -183,11 +184,13 @@ def main():
               ]}
     for name, values in (("grid", grid), ("measurements", measurements), ("effects", effects), ("oracle", oracles)):
         write_csv(output / f"{name}.csv", values)
+    figures = plot_report(report, grid, measurements, output)
     temporary = output / "summary.json.part"
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     commit_file(temporary, output / "summary.json")
     with wandb.init(project=config["wandb_project"], name=f"{config['name']}-oracle", group=config["name"],
                     job_type="diagnostic-analysis", dir=config["wandb_dir"], config=config) as run:
+        run.log({f"plots/{path.stem}": wandb.Image(str(path)) for path in figures})
         for name, values in summary.items():
             if values:
                 columns = list(values[0])
@@ -200,6 +203,10 @@ def main():
                 xs=nfe_values, ys=curves, keys=[f"{depth} codebooks" for depth in CODEBOOKS],
                 title=f"{domain}: spectral loss vs evaluations (0 = NDAC)", xname="NFE")})
     print(f"Saved {output / 'summary.json'} and grid/measurements/effects/oracle.csv")
+    print(f"Open {output / 'report.html'} for plots and their interpretation.")
+    audio_count = len(list((Path(config["cache"]) / "audio").glob("record_*/*.wav")))
+    print(f"Found {audio_count} assembled listening WAVs under {Path(config['cache']) / 'audio'}.")
+    print("Run sbatch slurm/listen.slurm to export/repair listening comparisons alongside the plots.")
     if not oracles:
         print("No allocation results: need recordings with enough full blocks for min_oracle_blocks.")
     for row in summary["oracle"]:
