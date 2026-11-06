@@ -28,13 +28,12 @@ def file_hash(path):
 
 
 class FlowCodec(nn.Module):
-    def __init__(self, checkpoint_dir, flow_checkpoint=None):
+    def __init__(self, checkpoint_dir, flow_checkpoint=None, load_backbone=True):
         super().__init__()
         if not (UPSTREAM / "flowdec").is_dir():
             raise FileNotFoundError("Run bash scripts/setup.sh first")
         sys.path.insert(0, str(UPSTREAM))
         from dac import DAC
-        from flowdec.backbones.ncsnpp import NCSNpp
         from flowdec.data.feature_extractors import AmplitudeCompressedComplexSTFT
         from omegaconf import OmegaConf
 
@@ -49,9 +48,12 @@ class FlowCodec(nn.Module):
         kwargs = ndac_state["metadata"]["kwargs"]
         self.ndac = DAC(**{k: v for k, v in kwargs.items() if k in inspect.signature(DAC).parameters})
         self.ndac.load_state_dict(ndac_state["state_dict"], strict=True)
-        config = yaml.safe_load((UPSTREAM / "config/model/backbone/ncsnpp_final_no_attn.yaml").read_text())
-        config.pop("_target_")
-        self.backbone = NCSNpp(**config)
+        self.backbone = nn.Identity()
+        if load_backbone:
+            from flowdec.backbones.ncsnpp import NCSNpp
+            config = yaml.safe_load((UPSTREAM / "config/model/backbone/ncsnpp_final_no_attn.yaml").read_text())
+            config.pop("_target_")
+            self.backbone = NCSNpp(**config)
         self.features = AmplitudeCompressedComplexSTFT(
             window_fn="hann", n_fft=1534, n_hops=4, sampling_rate=SAMPLE_RATE,
             alpha=0.3, beta=0.33,
@@ -61,9 +63,10 @@ class FlowCodec(nn.Module):
         state = checkpoint.get("flow_state", checkpoint.get("_pl_ema_state_dict", checkpoint.get("state_dict")))
         if state is None:
             raise ValueError(f"No FlowDec state in {flow_path}")
-        self.backbone.load_state_dict(
-            {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")}, strict=True
-        )
+        if load_backbone:
+            self.backbone.load_state_dict(
+                {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")}, strict=True
+            )
         self.features.load_state_dict(
             {k.removeprefix("feature_extractor."): v for k, v in state.items() if k.startswith("feature_extractor.")},
             strict=True,

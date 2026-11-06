@@ -1,0 +1,13 @@
+{
+  "manifest": "/scratch/mg8253/flow-bitrate/manifests/postfilter.csv",
+  "ears": "/scratch/mg8253/datasets/EARS",
+  "libritts": "/scratch/mk9649/shared/dcase2026_task5/dataset_copy/libritts/LibriTTS_R",
+  "jamendo": "/projects/work/marl/datasets/mtgjamendo",
+  "jamendo_metadata": "/home/mg8253/workspace/inversion/datasets/jamendo/raw.tsv",
+  "medleydb": "/projects/work/marl/sonyc/marl/private_datasets/MedleyDB/Audio",
+  "wavcaps": "/scratch/mk9649/shared/dcase2026_task5/dataset_copy/WavCaps",
+  "musiccaps": null,
+  "diagnostic_manifest": "/scratch/mg8253/flow-bitrate/manifests/diagnostic.csv",
+  "evaluation_seconds": 10,
+  "seed": 0
+}

@@ -13,6 +13,13 @@ if [[ "$task" == train ]]; then
   tasks_per_node="${SLURM_NTASKS_PER_NODE%%(*}"
   exec python -m flow_bitrate.train --devices "$tasks_per_node" --nodes "$SLURM_NNODES" \
     --accelerator gpu "$@"
+elif [[ "$task" == postfilter-train ]]; then
+  tasks_per_node="${SLURM_NTASKS_PER_NODE%%(*}"
+  exec python -m flow_bitrate.train_postfilter --devices "$tasks_per_node" --nodes "$SLURM_NNODES" "$@"
+elif [[ "$task" == postfilter-evaluate ]]; then
+  exec python -m flow_bitrate.evaluate_postfilter "$@"
+elif [[ "$task" == postfilter-data ]]; then
+  exec python scripts/make_postfilter_manifest.py --workers "${SLURM_CPUS_PER_TASK:-8}" "$@"
 elif [[ "$task" == prepare ]]; then
   exec python -m flow_bitrate.prepare --device cuda "$@"
 elif [[ "$task" == evaluate ]]; then
