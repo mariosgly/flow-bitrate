@@ -11,9 +11,10 @@ Question: can cylindrical flow matching reach the same reconstruction quality wi
 - Both geometries start from the same distribution: coarse complex spectrogram plus complex Gaussian noise. Cylindrical coordinates are taken after drawing that complex sample. The CyFM uniform prior and its optional amplitude/velocity ceilings are not used.
 - Cartesian paths interpolate real/imaginary parts. Cylindrical paths interpolate magnitude and shortest-arc phase. Both regress squared velocity error, summed over the two coordinates, excluding padded STFT frames. Cylindrical phase has unit weight, with no target-amplitude weighting.
 - No minibatch OT: each original audio crop stays paired with its own NDAC reconstruction.
+- EMA is not implemented for these trainable postfilters. Conditioning is always present: no classifier-free dropout or classifier-free guidance.
 - Sampling projects negative cylindrical amplitudes to zero and wraps phase. NFE=1 uses Euler; the default remaining budgets use midpoint, with two network calls per solver step.
 
-The new training entry point is `flow_bitrate.train_postfilter`: Lightning + W&B, DDP under Slurm, mixed precision, gradient accumulation and checkpoints. It uses the existing patched, pinned FlowDec dependency in `external/FlowDec`, not a second copy of the sibling checkout. No new packages are needed beyond the existing setup.
+The new training entry point is `flow_bitrate.train_postfilter`: Lightning + W&B, DDP under Slurm, mixed precision and checkpoints. Gradient accumulation is disabled. It uses the existing patched, pinned FlowDec dependency in `external/FlowDec`, not a second copy of the sibling checkout. No new packages are needed beyond the existing setup.
 
 ## Data
 
@@ -27,7 +28,7 @@ The original diagnostic source groups are held out from training, but that study
 
 Each Slurm job defaults to two GPUs. One Slurm task runs per GPU; Lightning handles distributed sampling. The worker sources `/home/mg8253/.bashrc`, `/ext3/env.sh` and the scratch settings inside the read-only container, then activates `/ext3/miniforge3/envs/flow-bitrate`. No packages or models are downloaded by a job.
 
-The default effective batch is 512 crops: 64 per GPU, two GPUs, four accumulated batches. Validation runs every 1,000 optimizer updates. Reconstruction metrics use the first two validation batches per rank, a small interleaved subset; flow loss uses the full selected validation set. Best-checkpoint selection uses spectral error at NFE=6 on that subset, not the incomparable flow losses of the two geometries. Increase `metric_batches` for broader reconstruction validation.
+The default effective batch is 128 crops: 64 per GPU, two GPUs, no gradient accumulation. Validation runs every 1,000 optimizer updates. Reconstruction metrics use the first two validation batches per rank, a small interleaved subset; flow loss uses the full selected validation set. Best-checkpoint selection uses spectral error at NFE=6 on that subset, not the incomparable flow losses of the two geometries. Increase `metric_batches` for broader reconstruction validation.
 
 W&B receives velocity losses, validation spectral error/SI-SDR at several NFEs, elapsed fit time and audio. FLOAT WAV examples also live in each run's `audio/` folder. Waveforms share their original scale. Fit time includes validation and is not a pure training-kernel benchmark.
 
@@ -37,7 +38,7 @@ W&B receives velocity losses, validation spectral error/SI-SDR at several NFEs, 
 
 After the data audit passes, submit `sbatch slurm/postfilter_smoke.slurm`. It defaults to cylindrical; append `--geometry cartesian` for the baseline. Each new submission is a fresh run.
 
-The ten-minute job keeps width 64, two-second crops, batch size 64 per GPU, four accumulated batches and bf16 mixed precision. It selects up to two source groups per dataset/split from the audited manifest, avoiding filesystem checks over the full corpus. A copy of those rows is saved as `smoke_manifest.csv`. Training samples 1,024 crops per epoch from this tiny source pool: two optimizer updates per epoch on two GPUs, for two epochs. The crop count follows the configured batch size and accumulation so the training loader stays nonempty. Validation and test select two recordings per domain; test still reconstructs ten seconds in five blocks. Validation measures NFE 1/2 and test measures NFE 2.
+The ten-minute job keeps width 64, two-second crops, batch size 64 per GPU, no gradient accumulation and bf16 mixed precision. It selects up to two source groups per dataset/split from the audited manifest, avoiding filesystem checks over the full corpus. A copy of those rows is saved as `smoke_manifest.csv`. Training samples 256 crops per epoch from this tiny source pool: two optimizer updates per epoch on two GPUs, for two epochs. The crop count follows the configured batch size so the training loader stays nonempty. Validation and test select two recordings per domain; test still reconstructs ten seconds in five blocks. Validation measures NFE 1/2 and test measures NFE 2.
 
 Checks require two DDP ranks, finite nonzero gradients, changing weights, two train/validation epochs, best/last checkpoints and finite test metrics after Lightning reloads `best.ckpt`. W&B receives losses, gradients, peak allocated GPU memory, audio and test metrics. It must run online; missing credentials/network access or offline mode prevents a success report. `smoke_success.json` is written after testing and W&B finish, and the Slurm log prints `SMOKE PASSED` with the run URL. An OOM or timeout is a failure; the script does not lower the batch size to hide it. This is a short pipeline/memory check, not a reconstruction-quality result or proof of long-run stability.
 

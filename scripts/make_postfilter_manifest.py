@@ -8,8 +8,10 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -19,13 +21,39 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = Path('/scratch/mg8253/flow-bitrate')
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3', '.ogg'}
+PROGRESS_PATH = None
+SCAN_DIRECTORY = None
+REFRESH_INDEX = False
+
+
+def report(stage, **details):
+    status = dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'), stage=stage, **details)
+    print(f"[{status['time']}] {stage}: " + ' '.join(f'{key}={value}' for key, value in details.items()), flush=True)
+    if PROGRESS_PATH is not None:
+        temporary = PROGRESS_PATH.with_suffix('.json.part')
+        temporary.write_text(json.dumps(status, indent=2) + '\n')
+        temporary.replace(PROGRESS_PATH)
 
 
 def audio_files(root):
     root = Path(root)
     if not root.is_dir():
         raise FileNotFoundError(f'Dataset directory is not accessible: {root}')
-    files, visited = [], set()
+    cache_path = SCAN_DIRECTORY / (hashlib.sha256(str(root.resolve()).encode()).hexdigest()[:20] + '.sqlite')
+    database = sqlite3.connect(cache_path)
+    database.execute('CREATE TABLE IF NOT EXISTS paths (original TEXT PRIMARY KEY, resolved TEXT)')
+    database.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER)')
+    if REFRESH_INDEX:
+        database.execute('DELETE FROM paths')
+        database.execute('DELETE FROM state')
+        database.commit()
+    known = dict(database.execute('SELECT original, resolved FROM paths'))
+    if database.execute("SELECT value FROM state WHERE key='complete'").fetchone():
+        database.close()
+        report('Reusing completed directory scan', root=str(root), files=len(known))
+        return [Path(path) for path in sorted(set(known.values()))]
+    report('Scanning audio directories', root=str(root), cached_files=len(known))
+    visited, new_files, last_report = set(), 0, time.monotonic()
     def walk_error(error):
         raise error
     for directory, folders, names in os.walk(root, followlinks=True, onerror=walk_error):
@@ -36,9 +64,26 @@ def audio_files(root):
             continue
         visited.add(identity)
         folders.sort()
-        files.extend((Path(directory) / name).resolve() for name in sorted(names)
-                     if Path(name).suffix.lower() in AUDIO_EXTENSIONS)
-    return sorted(set(files))
+        for name in sorted(names):
+            if Path(name).suffix.lower() not in AUDIO_EXTENSIONS:
+                continue
+            original = str(Path(directory) / name)
+            if original not in known:
+                resolved = str(Path(original).resolve())
+                known[original] = resolved
+                database.execute('INSERT OR REPLACE INTO paths VALUES (?, ?)', (original, resolved))
+                new_files += 1
+                if new_files % 256 == 0:
+                    database.commit()
+            if time.monotonic() - last_report >= 15:
+                database.commit()
+                report('Scanning audio directories', root=str(root), files=len(known), directory=directory)
+                last_report = time.monotonic()
+    database.execute("INSERT OR REPLACE INTO state VALUES ('complete', 1)")
+    database.commit()
+    database.close()
+    report('Directory scan complete', root=str(root), files=len(known))
+    return [Path(path) for path in sorted(set(known.values()))]
 
 
 def record(paths, dataset, domain, group, source_id, split='pool'):
@@ -48,6 +93,7 @@ def record(paths, dataset, domain, group, source_id, split='pool'):
 
 def collect(config):
     records, exclusions = [], []
+    report('Collecting EARS recordings')
     for path in audio_files(config['ears']):
         speaker = next((part for part in path.parts if re.fullmatch(r'p\d{3}', part)), None)
         if speaker is None or not 1 <= int(speaker[1:]) <= 107:
@@ -56,6 +102,7 @@ def collect(config):
         number = int(speaker[1:])
         split = 'train' if number <= 99 else 'val' if number <= 101 else 'test'
         records.append(record([path], 'ears', 'speech', f'speech:ears:{speaker}', path.stem, split))
+    report('Collecting LibriTTS-R recordings', collected=len(records))
     for path in audio_files(config['libritts']):
         subset = next((part for part in path.parts if part.startswith(('train-clean-', 'train-other-', 'dev-', 'test-'))), None)
         speaker = path.stem.split('_', 1)[0]
@@ -65,6 +112,7 @@ def collect(config):
         split = 'val' if subset.startswith('dev-') else 'test' if subset.startswith('test-') else 'pool'
         records.append(record([path], 'libritts_r', 'speech', f'speech:{speaker}', path.stem, split))
     # Jamendo's numeric audio folders do not identify artists; use its metadata.
+    report('Reading Jamendo artist metadata', collected=len(records))
     metadata = Path(config['jamendo_metadata'])
     if not metadata.is_file():
         raise FileNotFoundError(f'Need Jamendo artist metadata at {metadata}; see README installation commands')
@@ -88,6 +136,7 @@ def collect(config):
         paths.sort(key=lambda path: ({'.flac': 0, '.wav': 1, '.mp3': 2}.get(path.suffix.lower(), 3), str(path)))
         records.append(record(paths, 'jamendo', 'music', f'music:jamendo:{artist}', track_id))
     # MedleyDB is an additional held-out corpus. Never read stems/raw microphones.
+    report('Collecting MedleyDB mixes', collected=len(records))
     for path in audio_files(config['medleydb']):
         if path.stem.lower().endswith('_mix'):
             artist = path.stem[:-4].split('_', 1)[0]
@@ -96,6 +145,7 @@ def collect(config):
     metadata_path = wavcaps / 'json_files/FreeSound/fsd_final.json'
     if not metadata_path.is_file():
         raise FileNotFoundError(metadata_path)
+    report('Reading FreeSound uploader metadata', path=str(metadata_path))
     payload = json.loads(metadata_path.read_text())
     items = payload['data'] if isinstance(payload, dict) else payload
     freesound = defaultdict(list)
@@ -106,8 +156,11 @@ def collect(config):
                 freesound[path.stem].append(path)
     if not freesound:
         raise ValueError(f'No extracted FreeSound audio under {wavcaps / "data"}')
-    used_ids = set()
-    for item in items:
+    used_ids, last_report = set(), time.monotonic()
+    for index, item in enumerate(items):
+        if time.monotonic() - last_report >= 15:
+            report('Matching FreeSound metadata to audio', checked=index, total=len(items), collected=len(records))
+            last_report = time.monotonic()
         clip = Path(str(item['id'])).stem
         if clip in used_ids:
             continue
@@ -142,6 +195,7 @@ def collect(config):
     missing = required - {row['dataset'] for row in records}
     if missing:
         raise ValueError(f'No metadata-matched audio for: {sorted(missing)}')
+    report('Dataset inventory complete', recordings=len(records), exclusions=len(exclusions))
     return records, exclusions
 
 
@@ -199,10 +253,12 @@ def inspect_audio(path):
 
 
 def main():
+    global PROGRESS_PATH, SCAN_DIRECTORY, REFRESH_INDEX
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'configs/postfilter_data.json')
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--refresh-index', action='store_true', help='rescan roots after adding/removing dataset files')
     parser.add_argument('--input-manifest', type=Path, help='audit an existing CSV instead of discovering datasets')
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
@@ -214,6 +270,11 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     lock = output.with_suffix('.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    PROGRESS_PATH = output.with_suffix('.progress.json')
+    SCAN_DIRECTORY = output.with_suffix('.scans')
+    SCAN_DIRECTORY.mkdir(exist_ok=True)
+    REFRESH_INDEX = args.refresh_index
+    report('Starting data preparation', manifest=str(output), workers=args.workers)
     if output.exists() and not args.overwrite:
         raise FileExistsError(f'{output} exists; use --overwrite to rebuild from the cached audit')
     if args.input_manifest:
@@ -231,14 +292,20 @@ def main():
         if diagnostic.is_file():
             with diagnostic.open(newline='') as handle:
                 reserved = {row['group'].casefold() for row in csv.DictReader(handle)}
+        report('Assigning source-group splits', recordings=len(records))
         assign_splits(records, config['seed'], reserved)
     paths = sorted({path for row in records for path in row['paths']})
     if any(Path(path).suffix.lower() == '.mp3' for path in paths) and 'MP3' not in sf.available_formats():
         raise RuntimeError('This soundfile/libsndfile build cannot decode MP3. Repair the environment before training.')
     database = sqlite3.connect(output.with_suffix('.audit.sqlite'))
     database.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, result TEXT)')
-    inspected, pending = {}, []
-    for path in paths:
+    inspected, pending, last_report = {}, [], time.monotonic()
+    report('Checking saved decode audits', files=len(paths))
+    for index, path in enumerate(paths):
+        if time.monotonic() - last_report >= 15:
+            report('Checking saved decode audits', checked=index, total=len(paths),
+                   cached=len(inspected), need_decode=len(pending), path=path)
+            last_report = time.monotonic()
         try:
             stat = Path(path).stat()
         except OSError as error:
@@ -249,17 +316,37 @@ def main():
             inspected[path] = json.loads(saved[2])
         else:
             pending.append((path, stat.st_size, stat.st_mtime_ns))
-    print(f'{len(paths)} audio copies; {len(inspected)} cached checks; {len(pending)} files to decode fully', flush=True)
+    report('Full decode audit', audio_copies=len(paths), cached=len(inspected), to_decode=len(pending))
+    completed, uncommitted, last_commit = 0, 0, time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as workers, tqdm(total=len(pending), desc='decode audit') as progress:
         for start in range(0, len(pending), 64):
             batch = pending[start:start + 64]
-            for (path, size, mtime), result in zip(batch, workers.map(inspect_audio, [item[0] for item in batch])):
-                inspected[path] = result
-                database.execute('INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)',
-                                 (path, size, mtime, json.dumps(result)))
-                progress.update()
+            futures = {workers.submit(inspect_audio, item[0]): item for item in batch}
+            while futures:
+                done, _ = wait(futures, timeout=15, return_when=FIRST_COMPLETED)
+                for future in done:
+                    path, size, mtime = futures.pop(future)
+                    result = future.result()
+                    inspected[path] = result
+                    database.execute('INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)',
+                                     (path, size, mtime, json.dumps(result)))
+                    completed += 1
+                    uncommitted += 1
+                    progress.update()
+                    if uncommitted >= 16:
+                        database.commit()
+                        uncommitted = 0
+                if time.monotonic() - last_commit >= 15:
+                    database.commit()
+                    uncommitted = 0
+                    report('Full decode audit', completed=completed, total=len(pending),
+                           cached=len(paths) - len(pending),
+                           outstanding_examples=[item[0] for item in list(futures.values())[:2]])
+                    last_commit = time.monotonic()
             database.commit()
+            uncommitted = 0
     database.close()
+    report('Decode audit complete; selecting valid recordings', checked=len(paths))
     selected = []
     for item in records:
         row = {key: value for key, value in item.items() if key not in {'paths', 'path'}}
@@ -284,6 +371,7 @@ def main():
             continue
         selected.append(row)
     # Prefer held-out copies when identical decoded PCM exists across corpora.
+    report('Removing duplicate recordings', candidates=len(selected))
     kept, seen_audio, seen_ids, groups = [], set(), set(), {}
     for row in sorted(selected, key=lambda item: ({'test': 0, 'val': 1, 'train': 2}[item['split']], item['path'])):
         identity = row['dataset'], row['source_id']
@@ -305,6 +393,7 @@ def main():
                 raise ValueError(f'No usable audio after decode checks for {dataset}')
     fields = ['path', 'split', 'group', 'domain', 'dataset', 'source_id', 'start_seconds', 'sample_rate',
               'channels', 'frames', 'duration_seconds', 'file_size', 'mtime_ns', 'pcm_sha256']
+    report('Writing audited manifest', recordings=len(kept), exclusions=len(exclusions))
     temporary = output.with_suffix('.csv.part')
     with temporary.open('w', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -312,6 +401,7 @@ def main():
         writer.writerows({key: row.get(key, '') for key in fields} for row in kept)
     temporary.replace(output)
     from flow_bitrate.check_postfilter_data import check_loaders
+    report('Checking actual CPU dataloaders')
     loader_profiles = check_loaders(output, config['evaluation_seconds'], min(args.workers, 4))
     rejected = output.with_suffix('.excluded.csv')
     with rejected.open('w', newline='') as handle:
@@ -339,11 +429,12 @@ def main():
                           'WAV/FLAC copies share an ID; exact decoded-PCM duplicates are removed. Resampled/near duplicates are not ruled out.',
                           'EARS speaker split follows its benchmark; Jamendo/FreeSound splits are our source-group split.',
                           'Cross-corpus artist identities and released-checkpoint pretraining overlap are not fully known.'])
-    report = output.with_suffix('.summary.json')
-    temporary = report.with_suffix('.json.part')
+    summary_path = output.with_suffix('.summary.json')
+    temporary = summary_path.with_suffix('.json.part')
     temporary.write_text(json.dumps(summary, indent=2) + '\n')
-    temporary.replace(report)
-    print(f'Ready: {output}\nAudit summary: {report}\nExcluded files: {rejected}', flush=True)
+    temporary.replace(summary_path)
+    report('Ready', manifest=str(output), recordings=len(kept), summary=str(summary_path))
+    print(f'Ready: {output}\nAudit summary: {summary_path}\nExcluded files: {rejected}', flush=True)
 
 
 if __name__ == '__main__':

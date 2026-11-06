@@ -20,7 +20,9 @@ MusicCaps is optional and disabled by default: the supplied listing establishes 
 
 ## Preparation
 
-Run `sbatch slurm/postfilter_data.slurm` from the repository root. This is an eight-CPU, four-hour job, with no GPU and no downloads. It uses the same read-only container and environment as training. Rerun after a timeout; SQLite preserves completed checks in `manifests/postfilter.audit.sqlite`. A batch of at most 64 checks may need repeating after a kill. `--overwrite` rebuilds an already-published manifest using cached checks; do not rebuild while training is active.
+Run `sbatch slurm/postfilter_data.slurm` from the repository root. This is an eight-CPU, four-hour job, with no GPU and no downloads. It uses the same read-only container and environment as training. Rerun after a timeout; it does not automatically resubmit at the time limit. SQLite preserves completed checks in `manifests/postfilter.audit.sqlite`. At most 15 completed checks since the last commit, plus running files, may need repeating after a kill. `--overwrite` rebuilds an already-published manifest using cached checks; do not rebuild while training is active.
+
+Progress goes to `logs/flow-data-JOBID.out`, with decoder progress bars in `.err`. Stage messages and roughly 15-second scan/cache/decode updates also update `manifests/postfilter.progress.json`. Directory discovery is cached under `manifests/postfilter.scans/`, committing new paths every 256 files and reusing completed scans. Use `--refresh-index` after adding/removing files in the input datasets; it refreshes directory listings without discarding valid decode checks. Jobs started with the older script retain its logging/resume behavior until restarted.
 
 The job discovers WAV, FLAC, MP3 and OGG files; joins Jamendo artist and FreeSound author metadata; and keeps one usable recording per dataset ID. WavCaps FLAC is preferred to its converted WAV copy. It decodes the files fully in bounded chunks, checks finite/non-silent mono samples and partial seeking, and removes identical decoded-PCM duplicates, preferring held-out copies. Unreadable alternatives can fall back to a valid copy.
 
@@ -32,6 +34,7 @@ Outputs under `/scratch/mg8253/flow-bitrate/manifests/`:
 - `postfilter.summary.json`: readiness, recording/group counts, hours, library versions, metadata hashes and exclusion counts.
 - `postfilter.excluded.csv`: missing metadata/audio, corrupt files, duplicates, silence and short recordings.
 - `postfilter.audit.sqlite`: resumable per-file decode checks. Input audio stays in its shared directory.
+- `postfilter.scans/` and `postfilter.progress.json`: resumable directory discovery and current progress.
 
 ## Loading and evaluation
 
