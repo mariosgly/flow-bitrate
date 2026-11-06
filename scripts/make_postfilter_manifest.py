@@ -101,7 +101,7 @@ def collect(config):
             continue
         number = int(speaker[1:])
         split = 'train' if number <= 99 else 'val' if number <= 101 else 'test'
-        records.append(record([path], 'ears', 'speech', f'speech:ears:{speaker}', path.stem, split))
+        records.append(record([path], 'ears', 'speech', f'speech:ears:{speaker}', f'{speaker}/{path.stem}', split))
     report('Collecting LibriTTS-R recordings', collected=len(records))
     for path in audio_files(config['libritts']):
         subset = next((part for part in path.parts if part.startswith(('train-clean-', 'train-other-', 'dev-', 'test-'))), None)
@@ -259,6 +259,7 @@ def main():
     parser.add_argument('--workers', type=int, default=8)
     parser.add_argument('--overwrite', action='store_true')
     parser.add_argument('--refresh-index', action='store_true', help='rescan roots after adding/removing dataset files')
+    parser.add_argument('--finalize-only', action='store_true', help='rebuild splits/IDs/manifest from cached audits; never run full audio decoding')
     parser.add_argument('--input-manifest', type=Path, help='audit an existing CSV instead of discovering datasets')
     args = parser.parse_args()
     config = json.loads(args.config.read_text())
@@ -294,8 +295,9 @@ def main():
                 reserved = {row['group'].casefold() for row in csv.DictReader(handle)}
         report('Assigning source-group splits', recordings=len(records))
         assign_splits(records, config['seed'], reserved)
-    paths = sorted({path for row in records for path in row['paths']})
-    if any(Path(path).suffix.lower() == '.mp3' for path in paths) and 'MP3' not in sf.available_formats():
+    # Audit one preferred copy per recording. Alternatives are checked only on failure.
+    paths = sorted({row['paths'][0] for row in records})
+    if not args.finalize_only and any(Path(path).suffix.lower() == '.mp3' for path in paths) and 'MP3' not in sf.available_formats():
         raise RuntimeError('This soundfile/libsndfile build cannot decode MP3. Repair the environment before training.')
     database = sqlite3.connect(output.with_suffix('.audit.sqlite'))
     database.execute('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, result TEXT)')
@@ -312,11 +314,15 @@ def main():
             inspected[path] = dict(error=str(error))
             continue
         saved = database.execute('SELECT size, mtime, result FROM files WHERE path=?', (path,)).fetchone()
-        if saved and saved[:2] == (stat.st_size, stat.st_mtime_ns) and 'error' not in json.loads(saved[2]):
+        if saved and saved[:2] == (stat.st_size, stat.st_mtime_ns) and (args.finalize_only or 'error' not in json.loads(saved[2])):
             inspected[path] = json.loads(saved[2])
         else:
             pending.append((path, stat.st_size, stat.st_mtime_ns))
-    report('Full decode audit', audio_copies=len(paths), cached=len(inspected), to_decode=len(pending))
+    report('Full decode audit', preferred_copies=len(paths), cached=len(inspected), to_decode=len(pending))
+    if args.finalize_only and pending:
+        database.close()
+        raise RuntimeError(f'Finalize-only needs {len(pending)} missing/changed preferred-copy checks. '
+                           'Run preparation without --finalize-only to continue the audit.')
     completed, uncommitted, last_commit = 0, 0, time.monotonic()
     with ThreadPoolExecutor(max_workers=args.workers) as workers, tqdm(total=len(pending), desc='decode audit') as progress:
         for start in range(0, len(pending), 64):
@@ -345,18 +351,40 @@ def main():
                     last_commit = time.monotonic()
             database.commit()
             uncommitted = 0
-    database.close()
     report('Decode audit complete; selecting valid recordings', checked=len(paths))
     selected = []
     for item in records:
         row = {key: value for key, value in item.items() if key not in {'paths', 'path'}}
-        chosen = next((path for path in item['paths'] if 'error' not in inspected[path]), None)
+        chosen = None
+        for path in item['paths']:
+            if path not in inspected:
+                try:
+                    stat = Path(path).stat()
+                except OSError as error:
+                    inspected[path] = dict(error=str(error))
+                    continue
+                saved = database.execute('SELECT size, mtime, result FROM files WHERE path=?', (path,)).fetchone()
+                if saved and saved[:2] == (stat.st_size, stat.st_mtime_ns):
+                    inspected[path] = json.loads(saved[2])
+                elif args.finalize_only:
+                    database.close()
+                    raise RuntimeError(f'Finalize-only needs a cached alternative check for {path}; '
+                                       'run preparation without --finalize-only.')
+                else:
+                    report('Checking alternative after preferred-copy failure', path=path)
+                    inspected[path] = inspect_audio(path)
+                    database.execute('INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)',
+                                     (path, stat.st_size, stat.st_mtime_ns, json.dumps(inspected[path])))
+                    database.commit()
+            if 'error' not in inspected[path]:
+                chosen = path
+                break
         if chosen is None:
             for path in item['paths']:
                 exclusions.append(dict(path=path, reason=inspected[path]['error']))
             continue
         for path in item['paths']:
-            if 'error' in inspected[path]:
+            if path in inspected and 'error' in inspected[path]:
                 exclusions.append(dict(path=path, reason=inspected[path]['error']))
         row.update(inspected[chosen])
         row['path'] = chosen
@@ -370,6 +398,7 @@ def main():
             exclusions.append(dict(path=chosen, reason='ears_must_be_original_48khz'))
             continue
         selected.append(row)
+    database.close()
     # Prefer held-out copies when identical decoded PCM exists across corpora.
     report('Removing duplicate recordings', candidates=len(selected))
     kept, seen_audio, seen_ids, groups = [], set(), set(), {}
@@ -391,6 +420,9 @@ def main():
         for dataset in ('ears', 'libritts_r', 'jamendo', 'medleydb', 'wavcaps_freesound'):
             if not any(row['dataset'] == dataset for row in kept):
                 raise ValueError(f'No usable audio after decode checks for {dataset}')
+        for split in ('train', 'val', 'test'):
+            if not any(row['dataset'] == 'ears' and row['split'] == split for row in kept):
+                raise ValueError(f'No usable EARS {split} recordings after filtering')
     fields = ['path', 'split', 'group', 'domain', 'dataset', 'source_id', 'start_seconds', 'sample_rate',
               'channels', 'frames', 'duration_seconds', 'file_size', 'mtime_ns', 'pcm_sha256']
     report('Writing audited manifest', recordings=len(kept), exclusions=len(exclusions))
