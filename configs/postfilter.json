@@ -7,7 +7,7 @@
   "wandb_project": "flow-bitrate-postfilter",
   "codebooks": 6,
   "width": 64,
-  "batch_size": 2,
+  "batch_size": 64,
   "workers": 4,
   "accumulate": 4,
   "precision": "bf16-mixed",

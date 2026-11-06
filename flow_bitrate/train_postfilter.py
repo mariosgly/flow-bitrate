@@ -171,7 +171,8 @@ def main():
             raise ValueError("Use two GPUs for --smoke")
         if os.environ.get("WANDB_MODE", "online") not in {"online", "run"}:
             raise ValueError("This smoke test checks online W&B; unset WANDB_MODE=offline/disabled")
-        config.update(smoke=True, max_steps=-1, max_epochs=2, samples_per_epoch=32,
+        config.update(smoke=True, max_steps=-1, max_epochs=2,
+                      samples_per_epoch=2 * args.devices * args.nodes * config["batch_size"] * config["accumulate"],
                       workers=2, validation_per_domain=2, test_per_domain=2, metric_batches=2,
                       checkpoint_every=1, milestone_every=2, checkpoint_nfe=2,
                       validation_nfe=[1, 2], evaluation_nfe=[2], evaluation_seeds=[2])
