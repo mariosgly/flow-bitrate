@@ -13,7 +13,9 @@ export WANDB_DIR="$FLOW_SCRATCH/wandb"
 export WANDB_CACHE_DIR="$FLOW_SCRATCH/cache/wandb"
 export WANDB_DATA_DIR="$FLOW_SCRATCH/cache/wandb-data"
 export WANDB_ARTIFACT_DIR="$FLOW_SCRATCH/artifacts"
-export TMPDIR="$FLOW_SCRATCH/tmp/${SLURM_JOB_ID:-interactive-$$}/${SLURM_PROCID:-0}"
+# Multiprocessing sockets/temp files need local storage; NFS cleanup leaves busy .nfs files.
+# Persistent outputs and caches still go to FLOW_SCRATCH.
+export TMPDIR="/tmp/flow-bitrate-${USER:-mg8253}/${SLURM_JOB_ID:-interactive-$$}/${SLURM_PROCID:-0}"
 export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -o cache_dir=$FLOW_SCRATCH/cache/pytest --basetemp=$TMPDIR/pytest"
 mkdir -p "$PIP_CACHE_DIR" "$CONDA_PKGS_DIRS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" \
   "$TORCH_HOME" "$HF_HOME" "$PYTHONPYCACHEPREFIX" "$WANDB_DIR" "$WANDB_CACHE_DIR" \

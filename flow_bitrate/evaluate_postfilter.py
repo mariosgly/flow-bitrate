@@ -85,11 +85,16 @@ def main():
         checkpoint_hash = file_hash(checkpoint_path)
         model = Postfilter.load_from_checkpoint(checkpoint_path, map_location="cpu").eval().cuda()
         settings = model.hparams.config
-        if settings != config or model.hparams.provenance["manifest_sha256"] != expected_manifest:
-            raise ValueError("Compare models trained with the same data, bitrate and settings")
+        shared_settings = {key: value for key, value in settings.items() if key not in {"ema", "ema_decay"}}
+        expected_settings = {key: value for key, value in config.items() if key not in {"ema", "ema_decay"}}
+        if shared_settings != expected_settings or model.hparams.provenance["manifest_sha256"] != expected_manifest:
+            raise ValueError("Compare models with the same data, bitrate and settings, except the EMA ablation")
         parameters = sum(p.numel() for p in model.network.parameters())
         models.append({"name": label, "geometry": model.hparams.geometry, "seed": model.hparams.seed,
                        "checkpoint": str(checkpoint_path), "sha256": checkpoint_hash,
+                       "evaluation_weights": "ema" if model.ema_network is not None else "raw",
+                       "ema_decay": settings.get("ema_decay") if model.ema_network is not None else None,
+                       "ema_updates": model.ema_updates.item() if model.ema_updates is not None else 0,
                        "trainable_parameters": parameters, "fit_seconds": model.fit_seconds})
         released = FlowCodec(config["checkpoints"]).eval().cuda() if args.released and model_index == 0 else None
         if released is not None and released.identity != model.codec.identity:

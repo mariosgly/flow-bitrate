@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import os
+import time
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,8 +15,9 @@ import pytorch_lightning as pl
 import soundfile as sf
 import torch
 import torchaudio.functional as AF
-from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint, Timer
 from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.plugins.environments import SLURMEnvironment
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset, get_worker_info
 
@@ -103,6 +106,12 @@ class AudioCrops(Dataset):
         return audio[..., :target_samples]  # [1, 96000] during training; mono 48 kHz
 
 
+class SubmissionTimer(Timer):
+    def load_state_dict(self, state_dict):
+        # A resumed submission has a new wall-time allocation, not the old timer's elapsed budget.
+        pass
+
+
 class SmokeCheck(Callback):
     def __init__(self):
         self.epochs = 0
@@ -138,6 +147,11 @@ class SmokeCheck(Callback):
             raise RuntimeError("Smoke training stopped before two complete train/validation epochs")
         if torch.equal(self.initial_weight, next(model.network.parameters()).detach()):
             raise RuntimeError("Postfilter weights did not update")
+        if model.ema_network is not None:
+            if model.ema_updates.item() < self.gradient_steps:
+                raise RuntimeError("EMA did not update with the optimizer")
+            if not all(torch.isfinite(parameter).all() for parameter in model.ema_network.parameters()):
+                raise RuntimeError("Non-finite EMA weights")
 
 
 def tiny_rows(rows):
@@ -152,20 +166,22 @@ def tiny_rows(rows):
 
 
 def main():
+    launched_at = float(os.environ.get("FLOW_ALLOCATION_STARTED_AT", time.time()))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=ROOT / "configs/postfilter.json")
     parser.add_argument("--geometry", choices=("cartesian", "cylindrical"), required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=None,
+                        help="--ema enables EMA evaluation; --no-ema uses ordinary weights")
     parser.add_argument("--name")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--nodes", type=int, default=1)
-    parser.add_argument("--max-steps", type=int)
     parser.add_argument("--smoke", action="store_true", help="two tiny epochs, checkpoint reload and DDP test; real W&B logging")
     args = parser.parse_args()
     config = load_config(args.config)
-    if args.max_steps is not None:
-        config["max_steps"] = args.max_steps
+    if args.ema is not None:
+        config["ema"] = args.ema
     if args.smoke:
         if args.devices * args.nodes != 2:
             raise ValueError("Use two GPUs for --smoke")
@@ -218,7 +234,8 @@ def main():
                   "geometry": args.geometry, "seed": args.seed,
                   "world_size": args.devices * args.nodes, "settings": config}
     model = Postfilter(config, args.geometry, args.seed, provenance)
-    label = args.name or f"{'smoke-' if args.smoke else ''}{args.geometry}-k{config['codebooks']}-seed{args.seed}"
+    averaging = "ema" if config.get("ema", False) else "noema"
+    label = args.name or f"{'smoke-' if args.smoke else ''}{args.geometry}-{averaging}-k{config['codebooks']}-seed{args.seed}"
     if Path(label).name != label or label in {".", ".."}:
         raise ValueError("--name must be a folder name")
     resume = args.resume
@@ -239,7 +256,8 @@ def main():
         raise FileNotFoundError(resume)
     run_id = hashlib.sha256(str(run_dir).encode()).hexdigest()[:12]
     logger = WandbLogger(project=config["wandb_project"], name=run_dir.name, id=run_id,
-                         resume="allow" if resume else "never", group="smoke" if args.smoke else args.geometry,
+                         resume="allow" if resume else "never",
+                         group=f"{'smoke-' if args.smoke else ''}{args.geometry}-{averaging}",
                          save_dir=config["wandb_dir"], log_model=False)
     logger.log_hyperparams({"experiment": config, "geometry": args.geometry, "seed": args.seed,
                            "codec": model.codec.identity,
@@ -257,6 +275,16 @@ def main():
     smoke = SmokeCheck() if args.smoke else None
     if smoke is not None:
         callbacks.append(smoke)
+    deadline = None
+    if not args.smoke:
+        deadline = launched_at + config["allocation_hours"] * 3600
+        if os.environ.get("SLURM_JOB_END_TIME"):
+            deadline = min(deadline, float(os.environ["SLURM_JOB_END_TIME"]))
+        deadline -= config["shutdown_margin_minutes"] * 60
+        remaining = int(deadline - time.time())
+        if remaining <= 0:
+            raise RuntimeError("No training time remains after startup and checkpoint-saving margin")
+        callbacks.append(SubmissionTimer(duration=timedelta(seconds=remaining), interval="step"))
     loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0,
                           num_workers=config["workers"], pin_memory=True, drop_last=index == 0,
                           persistent_workers=config["workers"] > 0,
@@ -265,22 +293,27 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=args.nodes,
         strategy=DDPStrategy(find_unused_parameters=False) if args.devices * args.nodes > 1 else "auto",
-        precision=config["precision"], max_steps=config["max_steps"], max_epochs=config.get("max_epochs", -1),
+        precision=config["precision"], max_steps=-1, max_epochs=2 if args.smoke else -1,
         accumulate_grad_batches=config["accumulate"], gradient_clip_val=1.0,
         val_check_interval=1.0 if args.smoke else config["validate_every"] * config["accumulate"],
         check_val_every_n_epoch=1 if args.smoke else None,
         num_sanity_val_steps=1, logger=logger, callbacks=callbacks, default_root_dir=run_dir,
+        plugins=[SLURMEnvironment(auto_requeue=False)] if "SLURM_JOB_ID" in os.environ else None,
         enable_progress_bar="SLURM_JOB_ID" not in os.environ, log_every_n_steps=1 if args.smoke else 20,
     )
     if trainer.is_global_zero:
         (run_dir / "run.json").write_text(json.dumps({"name": run_dir.name, "wandb_id": run_id,
-                "config": config, "geometry": args.geometry, "resume": str(resume) if resume else None}, indent=2))
+                "config": config, "geometry": args.geometry, "resume": str(resume) if resume else None,
+                "training_deadline_unix": deadline}, indent=2))
         if args.smoke:
             with (run_dir / "smoke_manifest.csv").open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
         print(f"Run directory: {run_dir}", flush=True)
+        if deadline is not None:
+            print(f"Time-based run: {int(deadline - time.time())} seconds remain before the saving margin; "
+                  "no step or epoch cap, no automatic requeue.", flush=True)
     trainer.fit(model, *loaders, ckpt_path=str(resume) if resume else None)
     trainer.save_checkpoint(run_dir / "last.ckpt")
     if args.smoke:
@@ -306,6 +339,8 @@ def main():
             (run_dir / "smoke_success.json").write_text(json.dumps({"passed": True,
                 "world_size": trainer.world_size, "epochs": smoke.epochs, "validation_cycles": smoke.validations,
                 "optimizer_steps_per_rank": smoke.gradient_steps, "checkpoint_reloaded": str(best),
+                "evaluation_weights": averaging,
+                "ema_updates_in_reloaded_checkpoint": model.ema_updates.item() if model.ema_updates is not None else 0,
                 "test_metrics": results[0], "wandb_url": url}, indent=2, allow_nan=False))
             print(f"SMOKE PASSED: {run_dir / 'smoke_success.json'}\nW&B: {url}", flush=True)
         trainer.strategy.barrier()

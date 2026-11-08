@@ -1,5 +1,6 @@
 """Frozen NDAC, with the same conditional U-Net trained in either geometry."""
 
+import copy
 import time
 from pathlib import Path
 
@@ -24,6 +25,10 @@ class Postfilter(pl.LightningModule):
         # State + coarse condition: [B, 4 or 6, 768, padded_frames].
         self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
                                        out_channels=2, velocity_bound=None)
+        self.ema_network = copy.deepcopy(self.network).requires_grad_(False) if config.get("ema", False) else None
+        self.register_buffer("ema_updates", torch.zeros((), dtype=torch.long) if self.ema_network is not None else None)
+        if not 0 < config.get("ema_decay", 0.999) < 1:
+            raise ValueError("ema_decay must be between zero and one")
         self.rate_index = CODEBOOKS.index(config["codebooks"])
         self.fit_seconds = 0.0
         self.started = None
@@ -31,6 +36,8 @@ class Postfilter(pl.LightningModule):
     def train(self, mode=True):
         super().train(mode)
         self.codec.eval()
+        if self.ema_network is not None:
+            self.ema_network.eval()
         return self
 
     @torch.no_grad()
@@ -55,7 +62,8 @@ class Postfilter(pl.LightningModule):
 
     def velocity(self, state, condition, time_value):
         value = torch.cat((self.embedding(state), condition), dim=1)
-        return self.network(value, time_value).float()  # [B, 2, F, T]
+        network = self.ema_network if self.ema_network is not None and not self.training else self.network
+        return network(value, time_value).float()  # [B, 2, F, T]
 
     def start(self, condition, seed=None):
         generator = None if seed is None else torch.Generator(device=condition.device).manual_seed(seed)
@@ -174,6 +182,8 @@ class Postfilter(pl.LightningModule):
     def on_train_epoch_end(self):
         peak = torch.cuda.max_memory_allocated(self.device) / 1024 ** 3
         self.log("gpu/peak_allocated_gb", peak, sync_dist=True, reduce_fx="max", batch_size=1)
+        if self.ema_updates is not None:
+            self.log("ema/updates", self.ema_updates.float(), sync_dist=True, batch_size=1)
         if self.hparams.config.get("smoke"):
             print(f"Smoke rank {self.global_rank}: peak allocated {peak:.2f} GiB", flush=True)
 
@@ -184,12 +194,25 @@ class Postfilter(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.AdamW(self.network.parameters(), lr=self.hparams.config["lr"], weight_decay=0)
 
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        super().optimizer_step(epoch, batch_idx, optimizer, optimizer_closure)
+        if self.ema_network is not None:
+            # Update after the optimizer and before checkpoint callbacks run.
+            decay = self.hparams.config.get("ema_decay", 0.999)
+            with torch.no_grad():
+                for averaged, current in zip(self.ema_network.parameters(), self.network.parameters()):
+                    averaged.lerp_(current.detach(), 1 - decay)
+                for averaged, current in zip(self.ema_network.buffers(), self.network.buffers()):
+                    averaged.copy_(current)
+                self.ema_updates.add_(1)
+
     def on_fit_start(self):
         self.started = time.monotonic()
         torch.cuda.reset_peak_memory_stats(self.device)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["source_codec"] = self.codec.identity
+        checkpoint["evaluation_weights"] = "ema" if self.ema_network is not None else "raw"
         checkpoint["fit_seconds"] = self.fit_seconds + (time.monotonic() - self.started if self.started else 0)
 
     def on_load_checkpoint(self, checkpoint):

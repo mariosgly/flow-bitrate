@@ -38,25 +38,30 @@ Rerun that job after a timeout; completed decode checks are cached. Once it prin
 sbatch slurm/postfilter_smoke.slurm
 # Optional: check the Cartesian arm too.
 sbatch slurm/postfilter_smoke.slurm --geometry cartesian
+# Check the EMA path before submitting the long runs.
+sbatch slurm/postfilter_smoke.slurm --ema
 ```
 
 Each smoke job requests two GPUs for ten minutes: two tiny epochs, validation, best/last checkpoints, checkpoint reload and testing. It keeps the full model and training batch size. Look for `SMOKE PASSED`, `smoke_success.json`, W&B metrics/audio and `smoke/passed = 1`.
 
-Then submit full training:
+Then submit all four runs: Cartesian/cylindrical, each with and without EMA. Each requests four GPUs for 24 hours:
 
 ```bash
-sbatch slurm/postfilter_train.slurm --geometry cartesian --seed 0
-sbatch slurm/postfilter_train.slurm --geometry cylindrical --seed 0
+bash scripts/submit_postfilter_runs.sh
 ```
 
-Each fresh submission creates a new run directory and W&B ID, even with the same `--name`. To continue a run, add `--resume /scratch/mg8253/flow-bitrate/runs/RUN_NAME/last.ckpt`. Slurm requeues resume automatically. Settings are in `configs/postfilter.json`. [Data and splits](docs/data.md).
+Each run uses 64 crops per GPU (256 total), no accumulation, LR `5e-5`, and validation every 1,000 updates. Training stops by wall time, with no step/epoch cap and ten minutes reserved for saving. Startup counts against the allocation. All four simultaneous jobs use 16 GPUs total; Slurm queues them according to availability. EMA decay is `0.999`; validation/testing use averaged weights in the EMA runs. CFG is disabled in all runs.
+
+Each fresh submission creates a new run directory and W&B ID, even with the same `--name`. To continue a run in another allocation, add `--resume /scratch/mg8253/flow-bitrate/runs/RUN_NAME/last.ckpt` to its original training command, keeping the same geometry and `--ema`/`--no-ema` flag. Jobs do not automatically requeue at the time limit. Settings are in `configs/postfilter.json`. [Data and splits](docs/data.md).
 
 Compare the saved models on held-out audio, including released FlowDec. Replace the example run names with the directories printed by your jobs:
 
 ```bash
 sbatch slurm/postfilter_evaluate.slurm --released --checkpoints \
-  /scratch/mg8253/flow-bitrate/runs/cartesian-k6-seed0-JOBID/best.ckpt \
-  /scratch/mg8253/flow-bitrate/runs/cylindrical-k6-seed0-JOBID/best.ckpt
+  /scratch/mg8253/flow-bitrate/runs/cartesian-noema-k6-seed0-JOBID/best.ckpt \
+  /scratch/mg8253/flow-bitrate/runs/cartesian-ema-k6-seed0-JOBID/best.ckpt \
+  /scratch/mg8253/flow-bitrate/runs/cylindrical-noema-k6-seed0-JOBID/best.ckpt \
+  /scratch/mg8253/flow-bitrate/runs/cylindrical-ema-k6-seed0-JOBID/best.ckpt
 ```
 
 Plots, metrics and audio go to `/scratch/mg8253/flow-bitrate/runs/postfilter-comparison/`. [Experiment details](docs/postfilter.md).
