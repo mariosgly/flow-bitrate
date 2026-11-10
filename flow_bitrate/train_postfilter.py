@@ -34,11 +34,14 @@ class AudioCrops(Dataset):
         self.training = split == "train"
         self.seconds = seconds
         self.samples, self.seed, self.generator = samples, seed, None
-        self.domains = sorted({row.get("domain") or "audio" for row in self.rows})
-        self.by_domain = [[row for row in self.rows if (row.get("domain") or "audio") == domain]
+        # v2 content labels describe recordings; sampling still uses the three broad source pools.
+        def sampling_domain(row):
+            return row.get("sampling_domain") or row.get("domain") or "audio"
+        self.domains = sorted({sampling_domain(row) for row in self.rows})
+        self.by_domain = [[row for row in self.rows if sampling_domain(row) == domain]
                           for domain in self.domains]
-        self.by_source = [[[row for row in candidates if row.get("dataset", "audio") == source]
-                           for source in sorted({row.get("dataset", "audio") for row in candidates})]
+        self.by_source = [[[row for row in candidates if (row.get("sampling_dataset") or row.get("dataset", "audio")) == source]
+                           for source in sorted({row.get("sampling_dataset") or row.get("dataset", "audio") for row in candidates})]
                           for candidates in self.by_domain]
         if not self.training:
             # Spread fixed evaluation excerpts across source groups before reusing one.
@@ -58,13 +61,13 @@ class AudioCrops(Dataset):
                     for group in ordered:
                         if offset < len(groups[group]):
                             selected.append(groups[group][offset])
-                            if sum((r.get("domain") or "audio") == (candidates[0].get("domain") or "audio")
+                            if sum(sampling_domain(r) == sampling_domain(candidates[0])
                                    for r in selected) >= per_domain:
                                 break
                     else:
                         continue
                     break
-            buckets = [[row for row in selected if (row.get("domain") or "audio") == domain]
+            buckets = [[row for row in selected if sampling_domain(row) == domain]
                        for domain in self.domains]
             self.rows = [bucket[offset] for offset in range(max(map(len, buckets)))
                          for bucket in buckets if offset < len(bucket)]

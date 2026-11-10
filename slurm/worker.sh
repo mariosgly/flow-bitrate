@@ -20,6 +20,21 @@ elif [[ "$task" == postfilter-evaluate ]]; then
   exec python -m flow_bitrate.evaluate_postfilter "$@"
 elif [[ "$task" == postfilter-data ]]; then
   exec python scripts/make_postfilter_manifest.py --workers "${SLURM_CPUS_PER_TASK:-8}" "$@"
+elif [[ "$task" == libritts-extract ]]; then
+  exec python scripts/extract_libritts_r.py --shard "$SLURM_ARRAY_TASK_ID" "$@"
+elif [[ "$task" == postfilter-v2 || "$task" == wavcaps-labels ]]; then
+  status=0
+  if [[ "$task" == wavcaps-labels ]]; then
+    export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+    python scripts/classify_wavcaps.py --shard "$SLURM_ARRAY_TASK_ID" "$@" || status=$?
+  else
+    python scripts/postfilter_data_v2.py "$@" || status=$?
+  fi
+  if [[ "$status" == 75 ]]; then
+    echo "Slice saved; this shard is incomplete. Resubmit missing shards to continue."
+    exit 0
+  fi
+  exit "$status"
 elif [[ "$task" == prepare ]]; then
   exec python -m flow_bitrate.prepare --device cuda "$@"
 elif [[ "$task" == evaluate ]]; then

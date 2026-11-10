@@ -1,0 +1,19 @@
+#!/bin/bash
+#SBATCH --job-name=flow-extract
+#SBATCH --account=torch_pr_529_general
+#SBATCH --array=0-4
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=4G
+#SBATCH --time=02:00:00
+#SBATCH --output=/scratch/mg8253/flow-bitrate/logs/%x-%A_%a.out
+#SBATCH --error=/scratch/mg8253/flow-bitrate/logs/%x-%A_%a.err
+
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR}"
+FLOW_IMAGE="${FLOW_IMAGE:-/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif}"
+FLOW_OVERLAY="${FLOW_OVERLAY:-/scratch/mg8253/images/flow-matching-50GB.ext3}"
+srun --kill-on-bad-exit=1 singularity exec --fakeroot --overlay "${FLOW_OVERLAY}:ro" \
+  --bind /home:/home --bind /scratch:/scratch --bind /projects:/projects \
+  "$FLOW_IMAGE" bash --noprofile --norc slurm/worker.sh libritts-extract "$@"

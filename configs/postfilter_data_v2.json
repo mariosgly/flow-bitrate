@@ -1,0 +1,16 @@
+{
+  "base_config": "configs/postfilter_data.json",
+  "output": "/scratch/mg8253/flow-bitrate/manifests_v2",
+  "previous_manifest": "/scratch/mg8253/flow-bitrate/manifests/postfilter.csv",
+  "previous_audit": "/scratch/mg8253/flow-bitrate/manifests/postfilter.audit.sqlite",
+  "libritts_extra": "/scratch/mg8253/datasets/libritss/extracted",
+  "audioset_metadata": "/scratch/mg8253/datasets/audioset",
+  "audioset_segments": "/projects/work/marl/sonyc/AudioSet/csv",
+  "num_shards": 10,
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "model_dir": "/scratch/mg8253/flow-bitrate/models/wavcaps-labeler",
+  "batch_size": 8,
+  "max_seconds": 6900,
+  "evaluation_seconds": 10,
+  "seed": 0
+}
