@@ -1,6 +1,7 @@
 """A manifest in, small feature shards out. Splits stay at recording/group level."""
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -25,12 +26,21 @@ def load_config(path):
     return config
 
 
-def read_manifest(path):
+def matched_seed(*parts):
+    digest = hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).digest()
+    return int.from_bytes(digest[:8], "big") % (1 << 63)
+
+
+def read_manifest(path, dataset=None):
     path = Path(path)
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     if not rows or not {"path", "split", "group"} <= rows[0].keys():
         raise ValueError("Manifest needs path,split,group columns and at least one recording")
+    if dataset is not None:
+        rows = [row for row in rows if row.get("dataset") == dataset]
+        if not rows:
+            raise ValueError(f"No {dataset} tracks in {path}")
     groups, seen = {}, set()
     for row in rows:
         row["path"] = str((path.parent / row["path"]).resolve())

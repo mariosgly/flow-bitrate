@@ -17,10 +17,10 @@ import torch
 import wandb
 
 from .codec import BLOCK_SAMPLES, SAMPLE_RATE, SCRATCH, FlowCodec, file_hash
-from .data import read_manifest
+from .data import matched_seed, read_manifest
 from .metrics import si_sdr, spectral_loss
 from .postfilter import Postfilter
-from .train_postfilter import AudioCrops
+from .train_postfilter import AudioCrops, JamendoCrops
 
 
 @torch.inference_mode()
@@ -59,18 +59,26 @@ def main():
         raise ValueError("--name must be a folder name")
     first = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
     config = first["hyper_parameters"]["config"]
-    expected_manifest = first["hyper_parameters"]["provenance"]["manifest_sha256"]
+    provenance = first["hyper_parameters"]["provenance"]
+    expected_manifest = provenance["manifest_sha256"]
+    training_seed = first["hyper_parameters"]["seed"]
     del first
+    jamendo = config.get("dataset") == "jamendo"
+    if jamendo and args.released:
+        parser.error("Pass the scratch-trained FlowDec checkpoint for the Jamendo comparison")
     if file_hash(config["manifest"]) != expected_manifest:
         raise ValueError("The training manifest changed; restore its original split definitions")
-    rows = read_manifest(config["manifest"])
-    per_domain = args.per_domain or config["test_per_domain"]
+    rows = read_manifest(config["manifest"], dataset=config.get("dataset"))
+    count_key = "validation_per_domain" if jamendo and args.split == "val" else "test_per_domain"
+    per_domain = args.per_domain if args.per_domain is not None else config[count_key]
     if per_domain < 1:
         raise ValueError("--per-domain must be positive")
-    duration = config.get("evaluation_seconds", 2) if args.split == "test" else 2
+    duration = config.get("evaluation_seconds", 2) if jamendo or args.split == "test" else 2
     if duration < 2 or duration % 2:
         raise ValueError("Evaluation duration must be a positive multiple of two seconds")
-    data = AudioCrops(rows, args.split, per_domain=per_domain, seed=0, seconds=duration)
+    data_seed = training_seed if jamendo else 0
+    crop_type = JamendoCrops if jamendo else AudioCrops
+    data = crop_type(rows, args.split, per_domain=per_domain, seed=data_seed, seconds=duration)
     output = (Path(config["output"]) / args.name).resolve()
     if not output.is_relative_to(SCRATCH.resolve()):
         raise ValueError(f"Write reports under {SCRATCH}")
@@ -81,16 +89,21 @@ def main():
     labels = [path.parent.name for path in args.checkpoints]
     if len(set(labels)) != len(labels):
         raise ValueError("Checkpoint parent directories must have distinct run names")
+    arm_settings = {"backbone", "ema"} if jamendo else {"ema", "ema_decay"}
+    expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     for model_index, (checkpoint_path, label) in enumerate(zip(args.checkpoints, labels)):
         checkpoint_hash = file_hash(checkpoint_path)
         model = Postfilter.load_from_checkpoint(checkpoint_path, map_location="cpu").eval().cuda()
         settings = model.hparams.config
-        shared_settings = {key: value for key, value in settings.items() if key not in {"ema", "ema_decay"}}
-        expected_settings = {key: value for key, value in config.items() if key not in {"ema", "ema_decay"}}
+        shared_settings = {key: value for key, value in settings.items() if key not in arm_settings}
         if shared_settings != expected_settings or model.hparams.provenance["manifest_sha256"] != expected_manifest:
-            raise ValueError("Compare models with the same data, bitrate and settings, except the EMA ablation")
+            raise ValueError("Compare models from the same dataset, rate and evaluation protocol")
+        if jamendo and (model.hparams.seed != training_seed or any(
+                model.hparams.provenance[key] != provenance[key] for key in ("sources", "world_size"))):
+            raise ValueError("Jamendo checkpoints must share the source data, training seed and GPU count")
         parameters = sum(p.numel() for p in model.network.parameters())
-        models.append({"name": label, "geometry": model.hparams.geometry, "seed": model.hparams.seed,
+        models.append({"name": label, "backbone": model.backbone_name,
+                       "geometry": model.hparams.geometry, "seed": model.hparams.seed,
                        "checkpoint": str(checkpoint_path), "sha256": checkpoint_hash,
                        "evaluation_weights": "ema" if model.ema_network is not None else "raw",
                        "ema_decay": settings.get("ema_decay") if model.ema_network is not None else None,
@@ -102,21 +115,28 @@ def main():
         examples = set()
         for index, row in enumerate(data.rows):
             stat = Path(row["path"]).stat()
+            if jamendo and row.get("file_size") and (
+                    stat.st_size != int(row["file_size"]) or stat.st_mtime_ns != int(row["mtime_ns"])):
+                raise ValueError(f"Audio changed since its decode audit: {row['path']}")
             domain = row.get("domain") or "audio"
             export_audio = domain not in examples
             examples.add(domain)
             identity = {"checkpoint": checkpoint_hash, "model": label, "index": index, "source": row,
                         "source_size": stat.st_size, "source_mtime": stat.st_mtime_ns,
-                        "split": args.split, "data_seed": 0, "seconds": duration, "released": released is not None,
+                        "split": args.split, "data_seed": data_seed, "seconds": duration, "released": released is not None,
+                        "whole_excerpt": jamendo, "include_ndac": model_index == 0, "solver": config["solver"],
                         "nfe": config["evaluation_nfe"], "noise_seeds": config["evaluation_seeds"]}
             key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
             record_path = cache / f"{key}.json"
             if record_path.exists():
                 all_rows.extend(json.loads(record_path.read_text())["rows"])
                 continue
-            audio = data[index][None].cuda()
+            sample = data[index]
+            waveform, track = sample if jamendo else (sample, None)
+            audio = waveform[None].cuda()
             with torch.inference_mode():
-                coarse_blocks = [model.prepare(block)[0] for block in audio.split(BLOCK_SAMPLES, dim=-1)]
+                blocks = (audio,) if jamendo else audio.split(BLOCK_SAMPLES, dim=-1)
+                coarse_blocks = [model.coarse_audio(block) for block in blocks]
                 coarse = torch.cat(coarse_blocks, dim=-1)
             values = []
             baseline = {"path": row["path"], "domain": domain, "group": row["group"],
@@ -141,7 +161,7 @@ def main():
                 for nfe in config["evaluation_nfe"]:
                     errors, scores, seconds = [], [], []
                     for noise_index, sample_seed in enumerate(config["evaluation_seeds"]):
-                        seed = 1000000 + 100 * index + sample_seed
+                        seed = matched_seed("evaluation", track, sample_seed) if jamendo else 1000000 + 100 * index + sample_seed
                         torch.cuda.synchronize()
                         start = time.perf_counter()
                         reconstruction = torch.cat([enhance(block, nfe, seed + block_index * 10007, config["solver"])
@@ -175,7 +195,11 @@ def main():
         for (label, method, nfe), groups in sorted(grouped.items()):
             point = {field: label, "model": method, "nfe": nfe, "groups": len(groups)}
             for metric in ("spectral", "si_sdr", "postfilter_seconds"):
-                point[metric] = float(np.mean([np.mean([r[metric] for r in records]) for records in groups.values()]))
+                if jamendo:
+                    values = [record[metric] for records in groups.values() for record in records]
+                else:
+                    values = [np.mean([record[metric] for record in records]) for records in groups.values()]
+                point[metric] = float(np.mean(values))
             destination.append(point)
     domains = sorted({row["domain"] for row in summary})
     fig, axes = plt.subplots(2, len(domains), figsize=(5 * len(domains), 7), squeeze=False)
@@ -197,13 +221,18 @@ def main():
     fig.tight_layout()
     fig.savefig(output / "quality_vs_nfe.png", dpi=160)
     plt.close(fig)
-    save_json(output / "summary.json", {"config": config, "split": args.split, "models": models,
+    duration_note = ("Each ten-second excerpt is encoded and postfiltered in one pass." if jamendo else
+                     "Ten-second test excerpts are decoded in five independent two-second blocks; waveform metrics score the concatenation.")
+    comparison_note = ("FlowDec and CyFM use their respective optimizer recipes; the geometry comparison is within CyFM."
+                       if jamendo else "Released FlowDec has a different backbone and training history; use the trained Cartesian arm to isolate geometry.")
+    save_json(output / "summary.json", {"config": expected_settings if jamendo else config,
+              "split": args.split, "models": models,
               "results": summary, "by_dataset": by_dataset,
-              "notes": ["Means first average recordings within source groups, then average groups.",
+              "notes": ["Means average tracks equally." if jamendo else
+                        "Means first average recordings within source groups, then average groups.",
                         "NFE=1 uses Euler; other budgets use the configured solver.",
                         "Timing covers the postfilter including STFT/inverse, excluding NDAC and metrics.",
-                        "Ten-second test excerpts are decoded in five independent two-second blocks; waveform metrics score the concatenation.",
-                        "Released FlowDec has a different backbone and training history; use the trained Cartesian arm to isolate geometry.",
+                        duration_note, comparison_note,
                         "Spectral error and SI-SDR do not establish perceptual quality; listen to audio/."]})
     run_id = hashlib.sha256(str(output).encode()).hexdigest()[:12]
     with wandb.init(project=config["wandb_project"], name=args.name, id=run_id, resume="allow", dir=config["wandb_dir"]):

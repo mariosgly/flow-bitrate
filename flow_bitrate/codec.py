@@ -27,8 +27,16 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def flowdec_backbone():
+    from flowdec.backbones.ncsnpp import NCSNpp
+
+    config = yaml.safe_load((UPSTREAM / "config/model/backbone/ncsnpp_final_no_attn.yaml").read_text())
+    config.pop("_target_")
+    return NCSNpp(**config)
+
+
 class FlowCodec(nn.Module):
-    def __init__(self, checkpoint_dir, flow_checkpoint=None, load_backbone=True):
+    def __init__(self, checkpoint_dir, flow_checkpoint=None, load_backbone=True, configured_noise=False):
         super().__init__()
         if not (UPSTREAM / "flowdec").is_dir():
             raise FileNotFoundError("Run bash scripts/setup.sh first")
@@ -50,32 +58,42 @@ class FlowCodec(nn.Module):
         self.ndac.load_state_dict(ndac_state["state_dict"], strict=True)
         self.backbone = nn.Identity()
         if load_backbone:
-            from flowdec.backbones.ncsnpp import NCSNpp
-            config = yaml.safe_load((UPSTREAM / "config/model/backbone/ncsnpp_final_no_attn.yaml").read_text())
-            config.pop("_target_")
-            self.backbone = NCSNpp(**config)
+            self.backbone = flowdec_backbone()
         self.features = AmplitudeCompressedComplexSTFT(
             window_fn="hann", n_fft=1534, n_hops=4, sampling_rate=SAMPLE_RATE,
             alpha=0.3, beta=0.33,
         )
-        # Importing OmegaConf above also registers it for legacy Lightning checkpoints.
-        checkpoint = torch.load(flow_path, map_location="cpu", weights_only=False)
-        state = checkpoint.get("flow_state", checkpoint.get("_pl_ema_state_dict", checkpoint.get("state_dict")))
-        if state is None:
-            raise ValueError(f"No FlowDec state in {flow_path}")
-        if load_backbone:
-            self.backbone.load_state_dict(
-                {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")}, strict=True
+        self.identity = {"ndac": file_hash(ndac_path), "waveform_policy": "right-zero-pad-or-crop-to-96000-v1"}
+        if configured_noise:
+            from flowdec.data.sigma_models import from_file
+
+            config_path = UPSTREAM / "config/flowdec_75m.yaml"
+            options = yaml.safe_load(config_path.read_text())["model"]["sigma_y"]
+            curve_path = UPSTREAM / "data" / Path(options["filename"]).name
+            sigma = from_file(str(curve_path), factor=options["factor"], kernel_bandwidth=options["kernel_bandwidth"])
+            self.identity.update(
+                noise_curve=file_hash(curve_path), noise_config=file_hash(config_path),
+                waveform_policy="right-zero-pad-or-crop-to-input-length-v1",
             )
-        self.features.load_state_dict(
-            {k.removeprefix("feature_extractor."): v for k, v in state.items() if k.startswith("feature_extractor.")},
-            strict=True,
-        )
-        self.register_buffer("sigma", state["sigma_y"].float())
+        else:
+            # Importing OmegaConf above registers it for legacy Lightning checkpoints.
+            checkpoint = torch.load(flow_path, map_location="cpu", weights_only=False)
+            state = checkpoint.get("flow_state", checkpoint.get("_pl_ema_state_dict", checkpoint.get("state_dict")))
+            if state is None:
+                raise ValueError(f"No FlowDec state in {flow_path}")
+            if load_backbone:
+                self.backbone.load_state_dict(
+                    {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")}, strict=True
+                )
+            self.features.load_state_dict(
+                {k.removeprefix("feature_extractor."): v for k, v in state.items() if k.startswith("feature_extractor.")},
+                strict=True,
+            )
+            sigma = state["sigma_y"]
+            self.identity["flow"] = file_hash(flow_path)
+        self.register_buffer("sigma", sigma.float())
         if tuple(self.sigma.shape) not in {(768, 1), ()}:
             raise ValueError(f"Unexpected sigma shape: {self.sigma.shape}")
-        self.identity = {"ndac": file_hash(ndac_path), "flow": file_hash(flow_path),
-                         "waveform_policy": "right-zero-pad-or-crop-to-96000-v1"}
         self.ndac.requires_grad_(False)
         self.features.requires_grad_(False)
         self.eval()
@@ -87,31 +105,32 @@ class FlowCodec(nn.Module):
         return self
 
     @torch.no_grad()
-    def encode(self, audio):
-        # audio [B, 1, 96000], latent [B, 1024, 150], codes [B, 10, 150]
-        if audio.ndim != 3 or audio.shape[1:] != (1, BLOCK_SAMPLES):
-            raise ValueError(f"Expected audio [B, 1, {BLOCK_SAMPLES}], got {tuple(audio.shape)}")
+    def encode(self, audio, samples=BLOCK_SAMPLES):
+        hop = int(self.ndac.hop_length)
+        if samples <= 0 or samples % hop or audio.ndim != 3 or audio.shape[1:] != (1, samples):
+            raise ValueError(f"Expected audio [B, 1, {samples}] aligned to the codec hop, got {tuple(audio.shape)}")
         audio = self.ndac.preprocess(audio, SAMPLE_RATE)
         latent = self.ndac.encoder(audio)
         _, codes, _, _, _ = self.ndac.quantizer(latent, n_quantizers=10)
-        if latent.shape[1] != 1024 or codes.shape[1:] != (10, 150):
+        if latent.shape[1] != 1024 or codes.shape[1:] != (10, samples // hop):
             raise ValueError("This experiment expects the NDAC-75 checkpoint")
         return latent, codes
 
-    def _decode_block(self, quantized):
+    def _decode_block(self, quantized, samples=BLOCK_SAMPLES):
         waveform = self.ndac.decode(quantized)
-        missing = BLOCK_SAMPLES - waveform.shape[-1]
+        missing = samples - waveform.shape[-1]
         # Odd transposed-convolution strides can leave a short tail. Cropping alone
-        # cannot restore it. All rates use the same fixed two-second output policy.
-        if quantized.shape[-1] != 150 or abs(missing) >= int(self.ndac.hop_length):
+        # cannot restore it.
+        hop = int(self.ndac.hop_length)
+        if quantized.shape[-1] * hop != samples or abs(missing) >= hop:
             raise ValueError(f"Unexpected NDAC output: {quantized.shape[-1]} frames -> "
-                             f"{waveform.shape[-1]} samples; expected near {BLOCK_SAMPLES}")
-        return F.pad(waveform, (0, max(missing, 0)))[..., :BLOCK_SAMPLES]
+                             f"{waveform.shape[-1]} samples; expected near {samples}")
+        return F.pad(waveform, (0, max(missing, 0)))[..., :samples]
 
     @torch.no_grad()
-    def coarse(self, codes, codebooks):
+    def coarse(self, codes, codebooks, samples=BLOCK_SAMPLES):
         quantized, _, _ = self.ndac.quantizer.from_codes(codes[:, :codebooks])
-        return self._decode_block(quantized), quantized
+        return self._decode_block(quantized, samples), quantized
 
     @torch.no_grad()
     def coarse_at_rates(self, codes, rate):

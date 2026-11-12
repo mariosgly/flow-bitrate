@@ -19,10 +19,10 @@ from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelChec
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins.environments import SLURMEnvironment
 from pytorch_lightning.strategies import DDPStrategy
-from torch.utils.data import DataLoader, Dataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
 from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, file_hash
-from .data import load_config, read_manifest
+from .data import load_config, matched_seed, read_manifest
 from .postfilter import Postfilter
 
 
@@ -85,6 +85,9 @@ class AudioCrops(Dataset):
             row = candidates[torch.randint(len(candidates), (), generator=self.generator).item()]
         else:
             row = self.rows[index]
+        return self.read_crop(row, self.generator)
+
+    def read_crop(self, row, generator=None):
         if row.get("sample_rate") and row.get("frames"):
             rate, frames = int(row["sample_rate"]), int(row["frames"])
         else:
@@ -96,7 +99,7 @@ class AudioCrops(Dataset):
         if first < 0 or last < first:
             raise ValueError(f"Need {self.seconds} seconds after start_seconds: {row['path']}")
         if self.training:
-            start = torch.randint(first, last + 1, (), generator=self.generator).item()
+            start = torch.randint(first, last + 1, (), generator=generator).item()
         else:
             start = first if row.get("start_seconds") else (first + last) // 2
         value, _ = sf.read(row["path"], start=start, frames=needed, dtype="float32", always_2d=True)
@@ -106,7 +109,85 @@ class AudioCrops(Dataset):
         target_samples = round(self.seconds * SAMPLE_RATE)
         if audio.shape[-1] < target_samples or not torch.isfinite(audio).all():
             raise ValueError(f"Short or non-finite crop: {row['path']}")
-        return audio[..., :target_samples]  # [1, 96000] during training; mono 48 kHz
+        return audio[..., :target_samples]
+
+
+class JamendoCrops(AudioCrops):
+    def __init__(self, rows, split, seed, per_domain=32, seconds=2):
+        if split != "train":
+            rows = [row for row in rows if row["split"] == split
+                    and int(row["frames"]) - round(float(row.get("start_seconds") or 0) * int(row["sample_rate"]))
+                    >= math.ceil(seconds * int(row["sample_rate"]))]
+        super().__init__(rows, split, per_domain=per_domain, seed=seed, seconds=seconds)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, key):
+        index, epoch = key if isinstance(key, tuple) else (key, 0)
+        if index < 0:
+            return torch.zeros(1, round(self.seconds * SAMPLE_RATE)), -1 if self.training else ""
+        row = self.rows[index]
+        track = row["source_id"]
+        if self.training:
+            generator = torch.Generator().manual_seed(matched_seed("crop", self.seed, epoch, track))
+            return self.read_crop(row, generator), matched_seed("training", self.seed, epoch, track)
+        return self.read_crop(row), track
+
+
+class TrackSampler(Sampler):
+    """Shard a permutation exactly once. Empty slots align the final DDP update."""
+
+    def __init__(self, dataset, rank, world_size):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+        self.epoch = 0
+        self.skip = 0
+
+    def __len__(self):
+        return math.ceil(len(self.dataset) / self.world_size)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        epoch = self.epoch
+        size = len(self.dataset)
+        if self.dataset.training:
+            generator = torch.Generator().manual_seed(matched_seed("order", self.dataset.seed, epoch))
+            indices = torch.randperm(size, generator=generator).tolist()
+        else:
+            indices = list(range(size))
+        indices.extend([-1] * (len(self) * self.world_size - size))
+        offset = self.skip * self.world_size + self.rank
+        self.skip = 0
+        return ((index, epoch) for index in indices[offset::self.world_size])
+
+
+class TrackDataLoader(DataLoader):
+    batches_seen = 0
+
+    def state_dict(self):
+        return {"epoch": self.sampler.epoch, "batches_seen": self.batches_seen}
+
+    def load_state_dict(self, state_dict):
+        self.batches_seen = state_dict["batches_seen"]
+        self.sampler.set_epoch(state_dict["epoch"])
+        self.sampler.skip = self.batches_seen * self.batch_size
+
+
+class ValidationCheckpoint(ModelCheckpoint):
+    def on_train_batch_end(self, trainer, model, outputs, batch, batch_idx):
+        trainer.train_dataloader.batches_seen = batch_idx + 1
+
+    def on_validation_end(self, trainer, model):
+        if trainer.global_step > 0 and trainer.global_step % model.hparams.config["validate_every"] == 0:
+            super().on_validation_end(trainer, model)
+
+    def on_train_end(self, trainer, model):
+        # Lightning otherwise has a fallback save when no validation checkpoint exists.
+        pass
 
 
 class SubmissionTimer(Timer):
@@ -173,6 +254,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=ROOT / "configs/postfilter.json")
     parser.add_argument("--geometry", choices=("cartesian", "cylindrical"), required=True)
+    parser.add_argument("--backbone", choices=("flowdec", "cyfm"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=None,
                         help="--ema enables EMA evaluation; --no-ema uses ordinary weights")
@@ -183,8 +265,21 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="two tiny epochs, checkpoint reload and DDP test; real W&B logging")
     args = parser.parse_args()
     config = load_config(args.config)
+    jamendo = config.get("dataset") == "jamendo"
+    if args.backbone and not jamendo:
+        parser.error("--backbone is for the Jamendo experiment")
+    if jamendo:
+        config["backbone"] = args.backbone or "cyfm"
+        if args.smoke or config["codebooks"] != 6 or config["evaluation_seconds"] != 10:
+            parser.error("Jamendo runs use six codebooks, ten-second evaluation, and the full train split")
+        if config["accumulate"] != 1 or config["max_epochs"] < 1 or config["validate_every"] < 1:
+            parser.error("Jamendo needs one batch per update, a positive epoch budget and a validation interval")
+        if config["backbone"] == "flowdec" and (args.geometry != "cartesian" or args.ema is False):
+            parser.error("The FlowDec baseline uses Cartesian geometry and EMA")
     if args.ema is not None:
         config["ema"] = args.ema
+    if jamendo and config["backbone"] == "flowdec":
+        config["ema"] = True
     if args.smoke:
         if args.devices * args.nodes != 2:
             raise ValueError("Use two GPUs for --smoke")
@@ -195,8 +290,10 @@ def main():
                       workers=2, validation_per_domain=2, test_per_domain=2, metric_batches=2,
                       checkpoint_every=1, milestone_every=2, checkpoint_nfe=2,
                       validation_nfe=[1, 2], evaluation_nfe=[2], evaluation_seeds=[2])
-    if config["checkpoint_nfe"] not in config["validation_nfe"] or config["metric_batches"] < 1:
-        raise ValueError("Validation must measure checkpoint_nfe on at least one batch")
+    if (config["checkpoint_nfe"] not in config["validation_nfe"]
+            or (jamendo and not config["evaluation_seeds"])
+            or (not jamendo and config["metric_batches"] < 1)):
+        raise ValueError("Validation must measure checkpoint_nfe with at least one batch and noise draw")
     if config["solver"] not in {"euler", "midpoint"} or any(
         nfe < 1 or (config["solver"] == "midpoint" and nfe != 1 and nfe % 2)
         for nfe in config["validation_nfe"] + config["evaluation_nfe"]
@@ -211,7 +308,7 @@ def main():
         if not rows:
             raise ValueError("The prepared manifest is empty")
     else:
-        rows = read_manifest(config["manifest"])
+        rows = read_manifest(config["manifest"], dataset=config.get("dataset"))
     if config.get("require_data_audit", True):
         report_path = Path(config["manifest"]).with_suffix(".summary.json")
         if not report_path.is_file():
@@ -224,8 +321,16 @@ def main():
             raise ValueError("Data preparation and training configs disagree on test duration")
     rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", os.environ.get("LOCAL_RANK", "0"))))
     crop_seed = args.seed + 10000 * rank
-    train = AudioCrops(rows, "train", samples=config["samples_per_epoch"], seed=crop_seed)
-    valid = AudioCrops(rows, "val", per_domain=config["validation_per_domain"], seed=args.seed)
+    if jamendo:
+        track_ids = {row.get("source_id") for row in rows}
+        if None in track_ids or "" in track_ids or len(track_ids) != len(rows):
+            raise ValueError("The audited Jamendo manifest must contain one row per track ID")
+        train = JamendoCrops(rows, "train", args.seed)
+        valid = JamendoCrops(rows, "val", args.seed, per_domain=config["validation_per_domain"],
+                            seconds=config["evaluation_seconds"])
+    else:
+        train = AudioCrops(rows, "train", samples=config["samples_per_epoch"], seed=crop_seed)
+        valid = AudioCrops(rows, "val", per_domain=config["validation_per_domain"], seed=args.seed)
     # Fingerprint the source list and file metadata without reading whole audio files.
     sources = hashlib.sha256()
     for row in rows:
@@ -238,7 +343,8 @@ def main():
                   "world_size": args.devices * args.nodes, "settings": config}
     model = Postfilter(config, args.geometry, args.seed, provenance)
     averaging = "ema" if config.get("ema", False) else "noema"
-    label = args.name or f"{'smoke-' if args.smoke else ''}{args.geometry}-{averaging}-k{config['codebooks']}-seed{args.seed}"
+    prefix = f"jamendo-{config['backbone']}-" if jamendo else "smoke-" if args.smoke else ""
+    label = args.name or f"{prefix}{args.geometry}-{averaging}-k{config['codebooks']}-seed{args.seed}"
     if Path(label).name != label or label in {".", ".."}:
         raise ValueError("--name must be a folder name")
     resume = args.resume
@@ -266,15 +372,17 @@ def main():
                            "codec": model.codec.identity,
                            "trainable_parameters": sum(p.numel() for p in model.network.parameters()),
                            "global_batch_size": config["batch_size"] * args.devices * args.nodes * config["accumulate"]})
-    callbacks = [
+    callbacks = [ValidationCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
+                                      save_top_k=1, save_last=True, save_on_train_epoch_end=False,
+                                      enable_version_counter=False)] if jamendo else [
         ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
                         save_top_k=1, enable_version_counter=False),
         ModelCheckpoint(dirpath=run_dir, save_top_k=0, save_last=True,
                         every_n_train_steps=config["checkpoint_every"]),
         ModelCheckpoint(dirpath=run_dir, filename="step-{step:08d}", save_top_k=-1,
                         auto_insert_metric_name=False, every_n_train_steps=config["milestone_every"]),
-        LearningRateMonitor(logging_interval="step"),
     ]
+    callbacks.append(LearningRateMonitor(logging_interval="step"))
     smoke = SmokeCheck() if args.smoke else None
     if smoke is not None:
         callbacks.append(smoke)
@@ -288,19 +396,29 @@ def main():
         if remaining <= 0:
             raise RuntimeError("No training time remains after startup and checkpoint-saving margin")
         callbacks.append(SubmissionTimer(duration=timedelta(seconds=remaining), interval="step"))
-    loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0,
-                          num_workers=config["workers"], pin_memory=True, drop_last=index == 0,
-                          persistent_workers=config["workers"] > 0,
-                          generator=torch.Generator().manual_seed(crop_seed + index))
-               for index, dataset in enumerate((train, valid))]
+    loader_options = dict(num_workers=config["workers"], pin_memory=True, persistent_workers=config["workers"] > 0)
+    if jamendo:
+        world_size = args.devices * args.nodes
+        loaders = [
+            TrackDataLoader(train, batch_size=config["batch_size"], sampler=TrackSampler(train, rank, world_size),
+                            **loader_options),
+            DataLoader(valid, batch_size=1, sampler=TrackSampler(valid, rank, world_size), **loader_options),
+        ]
+        if len(loaders[0]) * config["max_epochs"] < config["validate_every"]:
+            raise ValueError("The epoch budget must reach at least one scheduled validation")
+    else:
+        loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0, drop_last=index == 0,
+                              generator=torch.Generator().manual_seed(crop_seed + index), **loader_options)
+                   for index, dataset in enumerate((train, valid))]
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=args.nodes,
         strategy=DDPStrategy(find_unused_parameters=False) if args.devices * args.nodes > 1 else "auto",
-        precision=config["precision"], max_steps=-1, max_epochs=2 if args.smoke else -1,
-        accumulate_grad_batches=config["accumulate"], gradient_clip_val=1.0,
+        precision=config["precision"], max_steps=-1, max_epochs=config["max_epochs"] if jamendo or args.smoke else -1,
+        accumulate_grad_batches=config["accumulate"], gradient_clip_val=None if jamendo else 1.0,
         val_check_interval=1.0 if args.smoke else config["validate_every"] * config["accumulate"],
         check_val_every_n_epoch=1 if args.smoke else None,
-        num_sanity_val_steps=1, logger=logger, callbacks=callbacks, default_root_dir=run_dir,
+        num_sanity_val_steps=0 if jamendo else 1, use_distributed_sampler=not jamendo,
+        logger=logger, callbacks=callbacks, default_root_dir=run_dir,
         plugins=[SLURMEnvironment(auto_requeue=False)] if "SLURM_JOB_ID" in os.environ else None,
         enable_progress_bar="SLURM_JOB_ID" not in os.environ, log_every_n_steps=1 if args.smoke else 20,
     )
@@ -315,10 +433,12 @@ def main():
                 writer.writerows(rows)
         print(f"Run directory: {run_dir}", flush=True)
         if deadline is not None:
-            print(f"Time-based run: {int(deadline - time.time())} seconds remain before the saving margin; "
-                  "no step or epoch cap, no automatic requeue.", flush=True)
+            budget = f"up to {config['max_epochs']} full track passes" if jamendo else "no step or epoch cap"
+            print(f"{int(deadline - time.time())} seconds remain before the wall-time margin; "
+                  f"{budget}, no automatic requeue.", flush=True)
     trainer.fit(model, *loaders, ckpt_path=str(resume) if resume else None)
-    trainer.save_checkpoint(run_dir / "last.ckpt")
+    if not jamendo:
+        trainer.save_checkpoint(run_dir / "last.ckpt")
     if args.smoke:
         trainer.strategy.barrier()
         best = run_dir / "best.ckpt"

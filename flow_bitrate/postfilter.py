@@ -8,8 +8,9 @@ import pytorch_lightning as pl
 import soundfile as sf
 import torch
 
-from .codec import BLOCK_SAMPLES, CODEBOOKS, SAMPLE_RATE, FlowCodec
+from .codec import BLOCK_SAMPLES, CODEBOOKS, SAMPLE_RATE, FlowCodec, flowdec_backbone
 from .cyfm_unet import CylindricalUNet
+from .data import matched_seed
 from .metrics import si_sdr, spectral_loss
 
 
@@ -19,12 +20,19 @@ class Postfilter(pl.LightningModule):
         if geometry not in {"cartesian", "cylindrical"}:
             raise ValueError("Choose cartesian or cylindrical")
         self.save_hyperparameters()
-        self.codec = FlowCodec(config["checkpoints"], load_backbone=False)
+        self.jamendo = config.get("dataset") == "jamendo"
+        self.backbone_name = config.get("backbone", "cyfm")
+        self.codec = FlowCodec(config["checkpoints"], load_backbone=False, configured_noise=self.jamendo)
         self.codec.requires_grad_(False)
         channels = 2 if geometry == "cartesian" else 3
         # State + coarse condition: [B, 4 or 6, 768, padded_frames].
-        self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
-                                       out_channels=2, velocity_bound=None)
+        if self.backbone_name == "flowdec":
+            if geometry != "cartesian":
+                raise ValueError("The original FlowDec backbone requires Cartesian inputs")
+            self.network = flowdec_backbone()
+        else:
+            self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
+                                           out_channels=2, velocity_bound=None)
         self.ema_network = copy.deepcopy(self.network).requires_grad_(False) if config.get("ema", False) else None
         self.register_buffer("ema_updates", torch.zeros((), dtype=torch.long) if self.ema_network is not None else None)
         if not 0 < config.get("ema_decay", 0.999) < 1:
@@ -41,11 +49,18 @@ class Postfilter(pl.LightningModule):
         return self
 
     @torch.no_grad()
-    def prepare(self, audio):
+    def coarse_audio(self, audio):
         # Keep the frozen codec and complex STFT in float32 under mixed precision.
         with torch.autocast(device_type=audio.device.type, enabled=False):
-            _, codes = self.codec.encode(audio.float())
-            coarse, _ = self.codec.coarse(codes, CODEBOOKS[self.rate_index])
+            samples = audio.shape[-1] if self.jamendo else BLOCK_SAMPLES
+            _, codes = self.codec.encode(audio.float(), samples)
+            coarse, _ = self.codec.coarse(codes, CODEBOOKS[self.rate_index], samples)
+        return coarse
+
+    @torch.no_grad()
+    def prepare(self, audio):
+        coarse = self.coarse_audio(audio)
+        with torch.autocast(device_type=audio.device.type, enabled=False):
             condition, target, info = self.codec.preprocess(coarse, audio.float())
         return coarse, condition, target, info
 
@@ -61,8 +76,12 @@ class Postfilter(pl.LightningModule):
         return torch.cat((amplitude, phase.cos(), phase.sin()), dim=1)
 
     def velocity(self, state, condition, time_value):
-        value = torch.cat((self.embedding(state), condition), dim=1)
         network = self.ema_network if self.ema_network is not None and not self.training else self.network
+        if self.backbone_name == "flowdec":
+            state = torch.complex(state[:, :1], state[:, 1:])
+            condition = torch.complex(condition[:, :1], condition[:, 1:])
+            return self.coordinates(network(state, condition, time_value))
+        value = torch.cat((self.embedding(state), condition), dim=1)
         return network(value, time_value).float()  # [B, 2, F, T]
 
     def start(self, condition, seed=None):
@@ -70,19 +89,37 @@ class Postfilter(pl.LightningModule):
         noise = torch.randn(condition.shape, dtype=condition.dtype, device=condition.device, generator=generator)
         return self.coordinates(condition + self.codec.sigma * noise), generator
 
-    def flow_loss(self, condition, target, frames, seed=None):
-        start, generator = self.start(condition, seed)
+    def matched_start(self, condition, seeds):
+        # CPU draws match even when jobs use different CUDA devices or batch shapes.
+        noise, times = [], []
+        for seed in seeds:
+            generator = torch.Generator().manual_seed(max(seed, 0))
+            noise.append(torch.randn(condition.shape[1:], dtype=condition.dtype, generator=generator))
+            times.append(torch.rand((), generator=generator))
+        noise = torch.stack(noise).to(condition.device)
+        return self.coordinates(condition + self.codec.sigma * noise), torch.stack(times).to(condition.device)
+
+    def velocity_errors(self, condition, target, frames, seed=None, example_seeds=None):
+        if example_seeds is None:
+            start, generator = self.start(condition, seed)
+            time_value = torch.rand(len(start), device=start.device, generator=generator)
+        else:
+            start, time_value = self.matched_start(condition, example_seeds)
         end = self.coordinates(target)
         velocity = end - start
         if self.hparams.geometry == "cylindrical":
             difference = velocity[:, 1:]
             velocity = torch.cat((velocity[:, :1], torch.atan2(difference.sin(), difference.cos())), 1)
-        time_value = torch.rand(len(start), device=start.device, generator=generator)
         state = start + time_value[:, None, None, None] * velocity
         prediction = self.velocity(state, self.embedding(self.coordinates(condition)), time_value)
-        # Sum the two squared coordinate errors; padded STFT frames carry no loss.
-        error = (prediction[..., :frames] - velocity[..., :frames]).square()
-        return error.sum(1).mean(), error.mean((0, 2, 3))
+        # Match the original FlowDec reduction in all five Jamendo runs.
+        if not self.jamendo:
+            prediction, velocity = prediction[..., :frames], velocity[..., :frames]
+        return (prediction - velocity).square().mean((2, 3))
+
+    def flow_loss(self, condition, target, frames, seed=None):
+        errors = self.velocity_errors(condition, target, frames, seed)
+        return errors.sum(1).mean(), errors.mean(0)
 
     @torch.no_grad()
     def enhance(self, coarse, nfe, seed=0, solver="midpoint"):
@@ -94,7 +131,10 @@ class Postfilter(pl.LightningModule):
             raise ValueError("Midpoint needs even NFE, except the one-call Euler case")
         with torch.autocast(device_type=coarse.device.type, enabled=False):
             condition, _, (scale, frames, length) = self.codec.preprocess(coarse.float())
-            state, _ = self.start(condition, seed)
+            if self.jamendo:
+                state, _ = self.matched_start(condition, [seed] * len(coarse))
+            else:
+                state, _ = self.start(condition, seed)
             embedded = self.embedding(self.coordinates(condition))
             steps = nfe // 2 if midpoint else nfe
             dt = 1.0 / steps
@@ -120,6 +160,18 @@ class Postfilter(pl.LightningModule):
         return waveform
 
     def training_step(self, audio, batch_idx):
+        if self.jamendo:
+            audio, seeds = audio
+            _, condition, target, info = self.prepare(audio)
+            errors = self.velocity_errors(condition, target, info[1], example_seeds=seeds.tolist())
+            real = seeds >= 0
+            count = self.trainer.strategy.reduce(real.sum(), reduce_op="sum")
+            # DDP averages gradients across ranks. Divide by the real global batch size,
+            # including when a final batch needs empty slots to keep the ranks in sync.
+            components = errors.masked_fill(~real[:, None], 0).sum(0) * (self.trainer.world_size / count)
+            loss = components.sum()
+            self.log("train/flow_loss", loss, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            return loss
         _, condition, target, info = self.prepare(audio)
         # Separate RNG from model initialisation; both geometries see matched draws.
         seed = self.hparams.seed + self.current_epoch * 10000019 + batch_idx * self.trainer.world_size + self.global_rank
@@ -130,6 +182,9 @@ class Postfilter(pl.LightningModule):
         return loss
 
     def validation_step(self, audio, batch_idx):
+        if self.jamendo:
+            self.jamendo_validation_step(audio, batch_idx)
+            return
         coarse, condition, target, info = self.prepare(audio)
         if batch_idx == 0 and self.started is not None:
             elapsed = self.fit_seconds + time.monotonic() - self.started
@@ -149,6 +204,44 @@ class Postfilter(pl.LightningModule):
                 self.log("val/spectral", distortion, sync_dist=True, batch_size=len(audio))
             if batch_idx == 0 and not self.trainer.sanity_checking:
                 self.log_audio(audio, coarse, output, "val", nfe)
+
+    def on_validation_epoch_start(self):
+        if self.jamendo:
+            self.validation_totals = torch.zeros(
+                (1 + len(self.hparams.config["validation_nfe"]), 2), device=self.device, dtype=torch.float64
+            )
+
+    def jamendo_validation_step(self, batch, batch_idx):
+        config = self.hparams.config
+        audio, tracks = batch
+        track = tracks[0]
+        if not track or self.global_step % config["validate_every"]:
+            return
+        coarse = self.coarse_audio(audio)
+        self.validation_totals[0, 0] += spectral_loss(audio, coarse).sum()
+        self.validation_totals[0, 1] += 1
+        for index, nfe in enumerate(config["validation_nfe"], start=1):
+            for sample_seed in config["evaluation_seeds"]:
+                seed = matched_seed("evaluation", track, sample_seed)
+                output = self.enhance(coarse, nfe, seed, config["solver"])
+                self.validation_totals[index, 0] += spectral_loss(audio, output).sum()
+                self.validation_totals[index, 1] += si_sdr(audio, output).sum()
+                if batch_idx == 0 and nfe == config["checkpoint_nfe"] and sample_seed == config["evaluation_seeds"][0]:
+                    self.log_audio(audio, coarse, output, "val", nfe)
+
+    def on_validation_epoch_end(self):
+        config = self.hparams.config
+        if not self.jamendo or self.global_step % config["validate_every"]:
+            return
+        totals = self.trainer.strategy.reduce(self.validation_totals, reduce_op="sum")
+        self.log("val/ndac_spectral", totals[0, 0] / totals[0, 1])
+        count = totals[0, 1] * len(config["evaluation_seeds"])
+        for index, nfe in enumerate(config["validation_nfe"], start=1):
+            spectral, sdr = totals[index] / count
+            self.log(f"val/spectral_nfe{nfe}", spectral)
+            self.log(f"val/si_sdr_nfe{nfe}", sdr)
+            if nfe == config["checkpoint_nfe"]:
+                self.log("val/spectral", spectral)
 
     def log_audio(self, original, coarse, output, stage, nfe):
         if self.global_rank != 0:
@@ -192,6 +285,14 @@ class Postfilter(pl.LightningModule):
         self.log("test/gpu_peak_allocated_gb", peak, sync_dist=True, reduce_fx="max", batch_size=1)
 
     def configure_optimizers(self):
+        if self.backbone_name == "flowdec":
+            return torch.optim.Adam(self.network.parameters(), lr=1e-4)
+        if self.jamendo:
+            optimizer = torch.optim.AdamW(self.network.parameters(), lr=2e-4, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.hparams.config["max_epochs"], eta_min=1e-6
+            )
+            return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
         return torch.optim.AdamW(self.network.parameters(), lr=self.hparams.config["lr"], weight_decay=0)
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
