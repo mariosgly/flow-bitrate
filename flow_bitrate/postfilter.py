@@ -164,14 +164,23 @@ class Postfilter(pl.LightningModule):
             audio, seeds = audio
             _, condition, target, info = self.prepare(audio)
             errors = self.velocity_errors(condition, target, info[1], example_seeds=seeds.tolist())
-            real = seeds >= 0
-            count = self.trainer.strategy.reduce(real.sum(), reduce_op="sum")
-            # DDP averages gradients across ranks. Divide by the real global batch size,
-            # including when a final batch needs empty slots to keep the ranks in sync.
-            components = errors.masked_fill(~real[:, None], 0).sum(0) * (self.trainer.world_size / count)
-            loss = components.sum()
-            self.log("train/flow_loss", loss, on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
-            return loss
+            loss_sum = errors.masked_fill(seeds[:, None] < 0, 0).sum()
+            loader = self.trainer.train_dataloader
+            accumulate = self.trainer.accumulate_grad_batches
+            window, microbatch = divmod(batch_idx, accumulate)
+            world_size = self.trainer.world_size
+            window_size = loader.batch_size * accumulate * world_size
+            count = min(window_size, len(loader.dataset) - window * window_size)
+            if microbatch == 0:
+                self.update_loss_sum = loss_sum.detach().clone()
+            else:
+                self.update_loss_sum += loss_sum.detach()
+            if microbatch == accumulate - 1:
+                self.log("train/flow_loss", self.update_loss_sum * (world_size / count),
+                         on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            # Lightning divides by accumulate and DDP averages across ranks.
+            # Every real crop in an update gets equal weight, including the epoch tail.
+            return loss_sum * (world_size * accumulate / count)
         _, condition, target, info = self.prepare(audio)
         # Separate RNG from model initialisation; both geometries see matched draws.
         seed = self.hparams.seed + self.current_epoch * 10000019 + batch_idx * self.trainer.world_size + self.global_rank

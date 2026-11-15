@@ -19,7 +19,23 @@ wandb login
 ## Jamendo postfilter comparison
 
 From the project root on HPC, with the pinned FlowDec dependency, frozen NDAC-75
-weights and [audited postfilter manifest](docs/data.md) available:
+weights and [audited postfilter manifest](docs/data.md) available, smoke-test the
+two EMA arms:
+
+```bash
+mkdir -p /scratch/mg8253/flow-bitrate/logs
+sbatch --ntasks-per-node=2 --gres=gpu:2 --time=00:30:00 --job-name=jamendo-smoke-flowdec \
+  slurm/postfilter_train.slurm --config configs/jamendo.json --smoke \
+  --backbone flowdec --geometry cartesian --ema
+sbatch --ntasks-per-node=2 --gres=gpu:2 --time=00:30:00 --job-name=jamendo-smoke-cylindrical \
+  slurm/postfilter_train.slurm --config configs/jamendo.json --smoke \
+  --backbone cyfm --geometry cylindrical --ema
+```
+
+Each smoke job uses the configured batch size and accumulation for three
+optimizer updates, then runs ten-second validation on two excerpts and checks
+that both checkpoints were written. Look for `SMOKE PASSED` and per-rank peak
+allocated GPU memory in the Slurm output. After both pass:
 
 ```bash
 bash scripts/submit_jamendo_runs.sh
@@ -39,11 +55,15 @@ contribute no loss. All five use FlowDec's reduction over the padded STFT grid.
 
 FlowDec uses Adam at a constant `1e-4`. CyFM uses AdamW at `2e-4` with weight
 decay `1e-4` and epoch-wise cosine annealing to `1e-6`. EMA decay is `0.999`.
-The [Jamendo config](configs/jamendo.json) sets 32 crops per GPU, 2 GPUs via the
-launcher (64 crops per full optimizer update), bf16 mixed precision and a
-40-epoch budget. Each job has an eight-hour allocation with a ten-minute stop
-margin. To continue a run in another allocation,
-submit the same training command with `--resume /absolute/path/to/last.ckpt`.
+The [Jamendo config](configs/jamendo.json) sets 8 crops per GPU, 2 GPUs via the
+launcher and 4 batches per optimizer update (64 crops per full update). Use
+`--accumulate 1` to update after each batch, for 16 crops per full update at
+the default batch size. Both the smoke commands and the five-run launcher
+accept `--batch-size` and `--accumulate`. Use the same values for smoke testing
+and training. Training uses bf16 mixed precision and a 40-epoch budget. Each
+job has an eight-hour allocation with a ten-minute stop margin. To continue a
+run in another allocation, submit the same training command with
+`--resume /absolute/path/to/last.ckpt`.
 
 Validation runs every 1,000 optimizer updates on up to 32 fixed ten-second
 excerpts. Each excerpt passes through NDAC and the postfilter as a single input.

@@ -138,15 +138,18 @@ class JamendoCrops(AudioCrops):
 class TrackSampler(Sampler):
     """Shard a permutation exactly once. Empty slots align the final DDP update."""
 
-    def __init__(self, dataset, rank, world_size):
+    def __init__(self, dataset, rank, world_size, window_size=1):
         self.dataset = dataset
         self.rank = rank
         self.world_size = world_size
+        self.window_size = window_size
         self.epoch = 0
         self.skip = 0
 
     def __len__(self):
-        return math.ceil(len(self.dataset) / self.world_size)
+        # Align epoch boundaries to optimizer steps so Lightning's batch-based
+        # validation trigger stays aligned to global_step across epochs.
+        return math.ceil(len(self.dataset) / (self.world_size * self.window_size)) * self.window_size
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -191,6 +194,10 @@ class ValidationCheckpoint(ModelCheckpoint):
 
 
 class SubmissionTimer(Timer):
+    def on_train_batch_end(self, trainer, model, outputs, batch, batch_idx):
+        if not model.jamendo or (batch_idx + 1) % trainer.accumulate_grad_batches == 0:
+            super().on_train_batch_end(trainer, model, outputs, batch, batch_idx)
+
     def load_state_dict(self, state_dict):
         # A resumed submission has a new wall-time allocation, not the old timer's elapsed budget.
         pass
@@ -227,12 +234,18 @@ class SmokeCheck(Callback):
             self.validations += 1
 
     def on_train_end(self, trainer, model):
-        if self.epochs < 2 or self.validations < 2 or self.gradient_steps < 4:
+        steps = model.hparams.config.get("jamendo_smoke_steps")
+        if steps is not None:
+            metric = trainer.callback_metrics.get("val/spectral")
+            if (trainer.global_step != steps or self.gradient_steps != steps or self.validations != 1
+                    or metric is None or not math.isfinite(float(metric))):
+                raise RuntimeError("Jamendo smoke needs all optimizer steps and one finite scheduled validation")
+        elif self.epochs < 2 or self.validations < 2 or self.gradient_steps < 4:
             raise RuntimeError("Smoke training stopped before two complete train/validation epochs")
         if torch.equal(self.initial_weight, next(model.network.parameters()).detach()):
             raise RuntimeError("Postfilter weights did not update")
         if model.ema_network is not None:
-            if model.ema_updates.item() < self.gradient_steps:
+            if model.ema_updates.item() != self.gradient_steps:
                 raise RuntimeError("EMA did not update with the optimizer")
             if not all(torch.isfinite(parameter).all() for parameter in model.ema_network.parameters()):
                 raise RuntimeError("Non-finite EMA weights")
@@ -255,6 +268,8 @@ def main():
     parser.add_argument("--config", default=ROOT / "configs/postfilter.json")
     parser.add_argument("--geometry", choices=("cartesian", "cylindrical"), required=True)
     parser.add_argument("--backbone", choices=("flowdec", "cyfm"))
+    parser.add_argument("--batch-size", type=int, help="Jamendo crops per GPU per forward pass")
+    parser.add_argument("--accumulate", type=int, help="Jamendo batches per optimizer update")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=None,
                         help="--ema enables EMA evaluation; --no-ema uses ordinary weights")
@@ -262,18 +277,23 @@ def main():
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--nodes", type=int, default=1)
-    parser.add_argument("--smoke", action="store_true", help="two tiny epochs, checkpoint reload and DDP test; real W&B logging")
+    parser.add_argument("--smoke", action="store_true", help="short two-GPU check of training and validation")
     args = parser.parse_args()
     config = load_config(args.config)
     jamendo = config.get("dataset") == "jamendo"
-    if args.backbone and not jamendo:
-        parser.error("--backbone is for the Jamendo experiment")
+    legacy_smoke = args.smoke and not jamendo
+    if not jamendo and any(value is not None for value in (args.backbone, args.batch_size, args.accumulate)):
+        parser.error("--backbone, --batch-size and --accumulate are for the Jamendo experiment")
     if jamendo:
         config["backbone"] = args.backbone or "cyfm"
-        if args.smoke or config["codebooks"] != 6 or config["evaluation_seconds"] != 10:
-            parser.error("Jamendo runs use six codebooks, ten-second evaluation, and the full train split")
-        if config["accumulate"] != 1 or config["max_epochs"] < 1 or config["validate_every"] < 1:
-            parser.error("Jamendo needs one batch per update, a positive epoch budget and a validation interval")
+        if args.batch_size is not None:
+            config["batch_size"] = args.batch_size
+        if args.accumulate is not None:
+            config["accumulate"] = args.accumulate
+        if config["codebooks"] != 6 or config["evaluation_seconds"] != 10:
+            parser.error("Jamendo runs use six codebooks and ten-second evaluation")
+        if min(config[key] for key in ("batch_size", "accumulate", "max_epochs", "validate_every")) < 1:
+            parser.error("Jamendo needs positive batch size, accumulation, epoch budget and validation interval")
         if config["backbone"] == "flowdec" and (args.geometry != "cartesian" or args.ema is False):
             parser.error("The FlowDec baseline uses Cartesian geometry and EMA")
     if args.ema is not None:
@@ -283,6 +303,11 @@ def main():
     if args.smoke:
         if args.devices * args.nodes != 2:
             raise ValueError("Use two GPUs for --smoke")
+        if args.resume is not None:
+            parser.error("Start smoke runs from fresh weights")
+    if jamendo and args.smoke:
+        config.update(jamendo_smoke_steps=3, validate_every=3, validation_per_domain=2)
+    if legacy_smoke:
         if os.environ.get("WANDB_MODE", "online") not in {"online", "run"}:
             raise ValueError("This smoke test checks online W&B; unset WANDB_MODE=offline/disabled")
         config.update(smoke=True, max_steps=-1, max_epochs=2,
@@ -301,7 +326,7 @@ def main():
         raise ValueError("Use positive NFE; midpoint budgets must be even, with NFE=1 using Euler")
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
-    if args.smoke:
+    if legacy_smoke:
         # Select before filesystem checks: a smoke job should not stat the whole corpus.
         with Path(config["manifest"]).open(newline="") as handle:
             rows = tiny_rows(list(csv.DictReader(handle)))
@@ -343,7 +368,7 @@ def main():
                   "world_size": args.devices * args.nodes, "settings": config}
     model = Postfilter(config, args.geometry, args.seed, provenance)
     averaging = "ema" if config.get("ema", False) else "noema"
-    prefix = f"jamendo-{config['backbone']}-" if jamendo else "smoke-" if args.smoke else ""
+    prefix = ("smoke-" if args.smoke else "") + (f"jamendo-{config['backbone']}-" if jamendo else "")
     label = args.name or f"{prefix}{args.geometry}-{averaging}-k{config['codebooks']}-seed{args.seed}"
     if Path(label).name != label or label in {".", ".."}:
         raise ValueError("--name must be a folder name")
@@ -399,12 +424,15 @@ def main():
     loader_options = dict(num_workers=config["workers"], pin_memory=True, persistent_workers=config["workers"] > 0)
     if jamendo:
         world_size = args.devices * args.nodes
+        accumulate = config["accumulate"]
+        window_size = config["batch_size"] * accumulate if accumulate > 1 else 1
         loaders = [
-            TrackDataLoader(train, batch_size=config["batch_size"], sampler=TrackSampler(train, rank, world_size),
+            TrackDataLoader(train, batch_size=config["batch_size"],
+                            sampler=TrackSampler(train, rank, world_size, window_size),
                             **loader_options),
             DataLoader(valid, batch_size=1, sampler=TrackSampler(valid, rank, world_size), **loader_options),
         ]
-        if len(loaders[0]) * config["max_epochs"] < config["validate_every"]:
+        if len(loaders[0]) // accumulate * config["max_epochs"] < config["validate_every"]:
             raise ValueError("The epoch budget must reach at least one scheduled validation")
     else:
         loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0, drop_last=index == 0,
@@ -413,10 +441,11 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=args.nodes,
         strategy=DDPStrategy(find_unused_parameters=False) if args.devices * args.nodes > 1 else "auto",
-        precision=config["precision"], max_steps=-1, max_epochs=config["max_epochs"] if jamendo or args.smoke else -1,
+        precision=config["precision"], max_steps=config.get("jamendo_smoke_steps", -1),
+        max_epochs=config["max_epochs"] if jamendo or args.smoke else -1,
         accumulate_grad_batches=config["accumulate"], gradient_clip_val=None if jamendo else 1.0,
-        val_check_interval=1.0 if args.smoke else config["validate_every"] * config["accumulate"],
-        check_val_every_n_epoch=1 if args.smoke else None,
+        val_check_interval=1.0 if legacy_smoke else config["validate_every"] * config["accumulate"],
+        check_val_every_n_epoch=1 if legacy_smoke else None,
         num_sanity_val_steps=0 if jamendo else 1, use_distributed_sampler=not jamendo,
         logger=logger, callbacks=callbacks, default_root_dir=run_dir,
         plugins=[SLURMEnvironment(auto_requeue=False)] if "SLURM_JOB_ID" in os.environ else None,
@@ -426,7 +455,7 @@ def main():
         (run_dir / "run.json").write_text(json.dumps({"name": run_dir.name, "wandb_id": run_id,
                 "config": config, "geometry": args.geometry, "resume": str(resume) if resume else None,
                 "training_deadline_unix": deadline}, indent=2))
-        if args.smoke:
+        if legacy_smoke:
             with (run_dir / "smoke_manifest.csv").open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                 writer.writeheader()
@@ -444,6 +473,12 @@ def main():
         best = run_dir / "best.ckpt"
         if not best.is_file() or not (run_dir / "last.ckpt").is_file():
             raise RuntimeError("Smoke test did not create both best.ckpt and last.ckpt")
+    if jamendo and args.smoke:
+        peak = torch.cuda.max_memory_allocated(model.device) / 1024 ** 3
+        print(f"Smoke rank {trainer.global_rank}: peak allocated {peak:.2f} GiB", flush=True)
+        if trainer.is_global_zero:
+            print(f"SMOKE PASSED: {trainer.global_step} optimizer updates; checkpoints in {run_dir}", flush=True)
+    if legacy_smoke:
         test = AudioCrops(rows, "test", per_domain=2, seed=args.seed, seconds=config["evaluation_seconds"])
         test_loader = DataLoader(test, batch_size=config["batch_size"], num_workers=2, pin_memory=True)
         # This reloads the saved weights through Lightning, then runs distributed testing.
