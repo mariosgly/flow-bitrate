@@ -18,8 +18,10 @@ import wandb
 
 from .codec import BLOCK_SAMPLES, SAMPLE_RATE, SCRATCH, FlowCodec, file_hash
 from .data import matched_seed, read_manifest
+from .jamendo_comparison import artist_reports, blind_packet
 from .metrics import si_sdr, spectral_loss
 from .postfilter import Postfilter
+from .sweep import save_audio
 from .train_postfilter import AudioCrops, JamendoCrops
 
 
@@ -53,6 +55,10 @@ def main():
     parser.add_argument("--name", default="postfilter-comparison")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--per-domain", type=int)
+    parser.add_argument("--nfe", type=int, nargs="+", help="Evaluate these network-call budgets")
+    parser.add_argument("--cohort-seed", type=int, help="Fixed Jamendo cohort, including across training seeds")
+    parser.add_argument("--listening-tracks", type=int, default=0,
+                        help="Prepare a blind A/B packet for the first N Jamendo excerpts and two checkpoints")
     parser.add_argument("--released", action="store_true", help="also measure the released FlowDec-75m")
     args = parser.parse_args()
     if Path(args.name).name != args.name or args.name in {".", ".."}:
@@ -64,6 +70,13 @@ def main():
     training_seed = first["hyper_parameters"]["seed"]
     del first
     jamendo = config.get("dataset") == "jamendo"
+    budgets = args.nfe if args.nfe is not None else config["evaluation_nfe"]
+    if len(set(budgets)) != len(budgets) or any(n < 1 or (config["solver"] == "midpoint" and n != 1 and n % 2) for n in budgets):
+        parser.error("Use distinct positive NFE budgets; midpoint accepts one or even budgets")
+    if args.listening_tracks < 0 or (args.listening_tracks and (not jamendo or len(args.checkpoints) != 2)):
+        parser.error("--listening-tracks requires two Jamendo checkpoints and a nonnegative count")
+    if args.cohort_seed is not None and not jamendo:
+        parser.error("--cohort-seed is for Jamendo")
     if jamendo and args.released:
         parser.error("Pass the scratch-trained FlowDec checkpoint for the Jamendo comparison")
     if file_hash(config["manifest"]) != expected_manifest:
@@ -77,6 +90,8 @@ def main():
     if duration < 2 or duration % 2:
         raise ValueError("Evaluation duration must be a positive multiple of two seconds")
     data_seed = training_seed if jamendo else 0
+    if args.cohort_seed is not None:
+        data_seed = args.cohort_seed
     crop_type = JamendoCrops if jamendo else AudioCrops
     data = crop_type(rows, args.split, per_domain=per_domain, seed=data_seed, seconds=duration)
     output = (Path(config["output"]) / args.name).resolve()
@@ -86,10 +101,12 @@ def main():
     cache.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
     all_rows, models = [], []
+    blind_sources = {}
     labels = [path.parent.name for path in args.checkpoints]
     if len(set(labels)) != len(labels):
         raise ValueError("Checkpoint parent directories must have distinct run names")
-    arm_settings = {"backbone", "ema", "batch_size", "accumulate"} if jamendo else {"ema", "ema_decay"}
+    arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier"}
+                    if jamendo else {"ema", "ema_decay"})
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     if jamendo:
         expected_batch = config["batch_size"] * config["accumulate"] * provenance["world_size"]
@@ -100,12 +117,17 @@ def main():
         shared_settings = {key: value for key, value in settings.items() if key not in arm_settings}
         if shared_settings != expected_settings or model.hparams.provenance["manifest_sha256"] != expected_manifest:
             raise ValueError("Compare models from the same dataset, rate and evaluation protocol")
-        if jamendo and (model.hparams.seed != training_seed or any(
+        if jamendo and ((args.cohort_seed is None and model.hparams.seed != training_seed) or any(
                 model.hparams.provenance[key] != provenance[key] for key in ("sources", "world_size"))):
-            raise ValueError("Jamendo checkpoints must share the source data, training seed and GPU count")
+            raise ValueError("Match sources and GPU counts. To compare different training seeds, set --cohort-seed.")
+        if models and model.codec.identity != models[0]["codec"]:
+            raise ValueError("Compare checkpoints with the same frozen codec and noise assets")
         parameters = sum(p.numel() for p in model.network.parameters())
         models.append({"name": label, "backbone": model.backbone_name,
                        "geometry": model.hparams.geometry, "seed": model.hparams.seed,
+                       "phase_loss": model.phase_loss, "tau_multiplier": settings.get("tau_multiplier"),
+                       "phase_weight_mean": settings.get("phase_calibration", {}).get("mean_q"),
+                       "codec": model.codec.identity, "step": model.checkpoint_step,
                        "checkpoint": str(checkpoint_path), "sha256": checkpoint_hash,
                        "evaluation_weights": "ema" if model.ema_network is not None else "raw",
                        "ema_decay": settings.get("ema_decay") if model.ema_network is not None else None,
@@ -133,10 +155,18 @@ def main():
                         "source_size": stat.st_size, "source_mtime": stat.st_mtime_ns,
                         "split": args.split, "data_seed": data_seed, "seconds": duration, "released": released is not None,
                         "whole_excerpt": jamendo, "include_ndac": model_index == 0, "solver": config["solver"],
-                        "nfe": config["evaluation_nfe"], "noise_seeds": config["evaluation_seeds"]}
+                        "nfe": budgets, "noise_seeds": config["evaluation_seeds"]}
             key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
             record_path = cache / f"{key}.json"
-            if record_path.exists():
+            listening = index < args.listening_tracks
+            required_wavs = []
+            if listening:
+                clip_dir = cache / f"{key}-audio"
+                blind_sources[index, label] = clip_dir
+                required_wavs = [clip_dir / f"nfe{n}.wav" for n in budgets]
+                if model_index == 0:
+                    required_wavs.extend([clip_dir / "reference.wav", clip_dir / "ndac.wav"])
+            if record_path.exists() and all(path.is_file() for path in required_wavs):
                 all_rows.extend(json.loads(record_path.read_text())["rows"])
                 continue
             sample = data[index]
@@ -152,6 +182,9 @@ def main():
                         "seconds": duration,
                         "codebooks": config["codebooks"], "nominal_kbps": config["codebooks"] * .75}
             if model_index == 0:
+                if listening:
+                    save_audio(clip_dir / "reference.wav", audio.flatten().cpu())
+                    save_audio(clip_dir / "ndac.wav", coarse.flatten().cpu())
                 values.append({**baseline, "model": "ndac", "nfe": 0,
                                "spectral": spectral_loss(audio, coarse).item(),
                                "si_sdr": si_sdr(audio, coarse).item(), "postfilter_seconds": 0.0})
@@ -166,7 +199,7 @@ def main():
             for method_name, enhance in methods:
                 # Warm up on each source before collecting decoder timings.
                 enhance(coarse_blocks[0], 1, 0, config["solver"])
-                for nfe in config["evaluation_nfe"]:
+                for nfe in budgets:
                     errors, scores, seconds = [], [], []
                     for noise_index, sample_seed in enumerate(config["evaluation_seeds"]):
                         seed = matched_seed("evaluation", track, sample_seed) if jamendo else 1000000 + 100 * index + sample_seed
@@ -178,6 +211,8 @@ def main():
                         seconds.append(time.perf_counter() - start)
                         errors.append(spectral_loss(audio, reconstruction).item())
                         scores.append(si_sdr(audio, reconstruction).item())
+                        if listening and noise_index == 0:
+                            save_audio(clip_dir / f"nfe{nfe}.wav", reconstruction.flatten().cpu())
                         if export_audio and noise_index == 0:
                             sf.write(audio_dir / f"{index:05d}_{method_name}_nfe{nfe}.wav",
                                      reconstruction[0, 0].cpu().numpy(), SAMPLE_RATE, subtype="FLOAT")
@@ -195,6 +230,14 @@ def main():
         writer.writeheader()
         writer.writerows(all_rows)
     temporary.replace(output / "metrics.csv")
+    if jamendo:
+        paired = (dict(method=r["model"], artist=r["group"], track=r["path"], nfe=r["nfe"], seed=None,
+                       spectral=r["spectral"], si_sdr=r["si_sdr"]) for r in all_rows)
+        artist_reports(output, paired, ("spectral", "si_sdr"))
+    if args.listening_tracks:
+        packet = blind_packet(output, data.rows[:args.listening_tracks], blind_sources, models, budgets,
+                              config["evaluation_seeds"][0])
+        print(f"Blind listening packet: {packet / 'listener'}")
     summary, by_dataset = [], []
     for field, destination in (("domain", summary), ("dataset", by_dataset)):
         grouped = defaultdict(lambda: defaultdict(list))
@@ -234,7 +277,7 @@ def main():
     comparison_note = ("FlowDec and CyFM use their respective optimizer recipes; the geometry comparison is within CyFM."
                        if jamendo else "Released FlowDec has a different backbone and training history; use the trained Cartesian arm to isolate geometry.")
     save_json(output / "summary.json", {"config": expected_settings if jamendo else config,
-              "split": args.split, "models": models,
+              "split": args.split, "cohort_seed": data_seed, "nfe": budgets, "models": models,
               "results": summary, "by_dataset": by_dataset,
               "notes": ["Means average tracks equally." if jamendo else
                         "Means first average recordings within source groups, then average groups.",

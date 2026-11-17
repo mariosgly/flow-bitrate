@@ -21,7 +21,7 @@ from pytorch_lightning.plugins.environments import SLURMEnvironment
 from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
-from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, file_hash
+from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, SCRATCH, file_hash
 from .data import load_config, matched_seed, read_manifest
 from .postfilter import Postfilter
 
@@ -269,7 +269,11 @@ def main():
     launched_at = float(os.environ.get("FLOW_ALLOCATION_STARTED_AT", time.time()))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=ROOT / "configs/postfilter.json")
-    parser.add_argument("--geometry", choices=("cartesian", "cylindrical"), required=True)
+    parser.add_argument("--geometry", choices=("cartesian", "disk", "cylindrical", "warped-disk"), required=True,
+                        help="disk is the Euclidean Cartesian control; warped-disk changes the training bridge")
+    parser.add_argument("--phase-loss", choices=("unit", "disk", "state-weighted"), default="unit")
+    parser.add_argument("--phase-calibration", type=Path, help="Training-split calibration.json for state-weighted loss")
+    parser.add_argument("--tau-multiplier", type=float, help="Transition scale in multiples of FlowDec's noise scale")
     parser.add_argument("--backbone", choices=("flowdec", "cyfm"))
     parser.add_argument("--batch-size", type=int, help="Jamendo crops per GPU per forward pass")
     parser.add_argument("--accumulate", type=int, help="Jamendo batches per optimizer update")
@@ -284,6 +288,31 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     jamendo = config.get("dataset") == "jamendo"
+    if args.geometry == "disk":
+        args.geometry = "cartesian"
+    if args.phase_loss != "unit" and (not jamendo or args.geometry != "cylindrical"):
+        parser.error("--phase-loss disk/state-weighted requires the cylindrical Jamendo arm")
+    if args.geometry == "warped-disk" and not jamendo:
+        parser.error("--geometry warped-disk requires the Jamendo config")
+    if args.phase_calibration and args.phase_loss != "state-weighted":
+        parser.error("--phase-calibration is used with --phase-loss state-weighted")
+    if args.tau_multiplier is not None and (not math.isfinite(args.tau_multiplier) or args.tau_multiplier <= 0
+            or (args.geometry != "warped-disk" and args.phase_loss != "state-weighted")):
+        parser.error("--tau-multiplier must be positive and is used with warped-disk or state-weighted")
+    if args.phase_loss != "unit":
+        config["phase_loss"] = args.phase_loss
+    if args.geometry == "warped-disk" or args.phase_loss == "state-weighted":
+        config["tau_multiplier"] = args.tau_multiplier if args.tau_multiplier is not None else 1.0
+    if args.phase_loss == "state-weighted":
+        if args.resume and not args.phase_calibration:
+            saved = torch.load(args.resume, map_location="cpu", weights_only=False)
+            config["phase_calibration"] = saved["hyper_parameters"]["config"]["phase_calibration"]
+            del saved
+        else:
+            calibration_path = args.phase_calibration or SCRATCH / "jamendo-geometry" / "calibration.json"
+            config["phase_calibration"] = json.loads(calibration_path.read_text())
+        if args.tau_multiplier is None:
+            config["tau_multiplier"] = config["phase_calibration"]["tau_multiplier"]
     legacy_smoke = args.smoke and not jamendo
     if not jamendo and any(value is not None for value in (args.backbone, args.batch_size, args.accumulate)):
         parser.error("--backbone, --batch-size and --accumulate are for the Jamendo experiment")
@@ -372,7 +401,8 @@ def main():
     model = Postfilter(config, args.geometry, args.seed, provenance)
     averaging = "ema" if config.get("ema", False) else "noema"
     prefix = ("smoke-" if args.smoke else "") + (f"jamendo-{config['backbone']}-" if jamendo else "")
-    label = args.name or f"{prefix}{args.geometry}-{averaging}-k{config['codebooks']}-seed{args.seed}"
+    arm = args.geometry if args.phase_loss == "unit" else f"{args.geometry}-{args.phase_loss}"
+    label = args.name or f"{prefix}{arm}-{averaging}-k{config['codebooks']}-seed{args.seed}"
     if Path(label).name != label or label in {".", ".."}:
         raise ValueError("--name must be a folder name")
     resume = args.resume
@@ -387,21 +417,23 @@ def main():
             resume = max(hpc, key=lambda item: int(item.stem.rsplit("_", 1)[1]))
         elif (run_dir / "last.ckpt").exists():
             resume = run_dir / "last.ckpt"
-    if resume is None and (run_dir / "last.ckpt").exists():
+        elif jamendo and (run_dir / "best.ckpt").exists():
+            resume = run_dir / "best.ckpt"
+    if resume is None and ((run_dir / "last.ckpt").exists() or (jamendo and (run_dir / "best.ckpt").exists())):
         raise FileExistsError("This run directory already has a checkpoint; use --resume or a fresh submission")
     if resume is not None and not resume.is_file():
         raise FileNotFoundError(resume)
     run_id = hashlib.sha256(str(run_dir).encode()).hexdigest()[:12]
     logger = WandbLogger(project=config["wandb_project"], name=run_dir.name, id=run_id,
                          resume="allow" if resume else "never",
-                         group=f"{'smoke-' if args.smoke else ''}{args.geometry}-{averaging}",
+                         group=f"{'smoke-' if args.smoke else ''}{arm}-{averaging}",
                          save_dir=config["wandb_dir"], log_model=False)
     logger.log_hyperparams({"experiment": config, "geometry": args.geometry, "seed": args.seed,
                            "codec": model.codec.identity,
                            "trainable_parameters": sum(p.numel() for p in model.network.parameters()),
                            "global_batch_size": config["batch_size"] * args.devices * args.nodes * config["accumulate"]})
     callbacks = [ValidationCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
-                                      save_top_k=1, save_last=True, save_on_train_epoch_end=False,
+                                      save_top_k=1, save_last=False, save_on_train_epoch_end=False,
                                       enable_version_counter=False)] if jamendo else [
         ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
                         save_top_k=1, enable_version_counter=False),
@@ -473,9 +505,10 @@ def main():
         trainer.save_checkpoint(run_dir / "last.ckpt")
     if args.smoke:
         trainer.strategy.barrier()
-        best = run_dir / "best.ckpt"
-        if not best.is_file() or not (run_dir / "last.ckpt").is_file():
-            raise RuntimeError("Smoke test did not create both best.ckpt and last.ckpt")
+        if not (run_dir / "best.ckpt").is_file():
+            raise RuntimeError("Smoke test did not create best.ckpt")
+        if not jamendo and not (run_dir / "last.ckpt").is_file():
+            raise RuntimeError("Smoke test did not create last.ckpt")
     if jamendo and args.smoke and trainer.is_global_zero:
         print(f"SMOKE PASSED: {trainer.global_step} optimizer updates; checkpoints in {run_dir}", flush=True)
     if legacy_smoke:

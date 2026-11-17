@@ -65,15 +65,16 @@ Use the same values for smoke testing and training. Training uses bf16 mixed
 precision and a 40-epoch budget. Each
 job has an eight-hour allocation with a ten-minute stop margin. To continue a
 run in another allocation, submit the same training command with
-`--resume /absolute/path/to/last.ckpt`.
+`--resume /absolute/path/to/best.ckpt`.
 
 Validation runs every 1,000 optimizer updates on up to 32 fixed ten-second
 excerpts. Each excerpt passes through NDAC and the postfilter as a single input.
-`last.ckpt` records the latest scheduled validation and `best.ckpt` follows mean
-spectral error at six network evaluations. Work after the latest validation
-remains unsaved if the allocation ends between validations.
+Each run keeps one `best.ckpt`, selected by the lowest mean spectral error at
+six network evaluations. Resuming starts from the update saved in that file.
 
-Pass the five resulting checkpoints to the shared evaluator:
+For FAD, SI-SDR, fwSSNR and logSpecMSE on the held-out Jamendo split, use the
+[resumable scorer](docs/jamendo-scoring.md). For a quick sweep over inference
+steps with SI-SDR and the training spectral metric, use the original evaluator:
 
 ```bash
 sbatch slurm/postfilter_evaluate.slurm --name jamendo-comparison --checkpoints \
@@ -87,6 +88,13 @@ sbatch slurm/postfilter_evaluate.slurm --name jamendo-comparison --checkpoints \
 The evaluator uses up to 64 fixed ten-second Jamendo test excerpts and the same
 noise seeds, solver and network-evaluation budgets for every model. It reports
 spectral error, SI-SDR, postfilter time, audio examples and a comparison plot.
+
+### Disk geometry and phase weighting
+
+The [Jamendo disk experiment guide](docs/jamendo-geometry.md) gives the geometry,
+validation diagnostic, training commands and blinded listening protocol. Start with
+`bash scripts/submit_jamendo_geometry.sh audit`. The existing Cartesian and
+cylindrical CyFM EMA checkpoints serve as the two controls.
 
 ## Train the mixed-dataset postfilters
 

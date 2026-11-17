@@ -1,30 +1,55 @@
 """Frozen NDAC, with the same conditional U-Net trained in either geometry."""
 
 import copy
+import math
 import time
 from pathlib import Path
 
 import pytorch_lightning as pl
 import soundfile as sf
 import torch
+import torch.nn.functional as F
 
 from .codec import BLOCK_SAMPLES, CODEBOOKS, SAMPLE_RATE, FlowCodec, flowdec_backbone
 from .cyfm_unet import CylindricalUNet
 from .data import matched_seed
 from .metrics import si_sdr, spectral_loss
+from .phase_geometry import PHASE_FLOOR, matched_draw, noise_scale, phase_weight, warped_disk_bridge
 
 
 class Postfilter(pl.LightningModule):
     def __init__(self, config, geometry, seed=0, provenance=None):
         super().__init__()
-        if geometry not in {"cartesian", "cylindrical"}:
-            raise ValueError("Choose cartesian or cylindrical")
+        if geometry == "disk":
+            geometry = "cartesian"
+        if geometry not in {"cartesian", "cylindrical", "warped-disk"}:
+            raise ValueError(f"Unknown bridge geometry: {geometry}")
         self.save_hyperparameters()
         self.jamendo = config.get("dataset") == "jamendo"
         self.backbone_name = config.get("backbone", "cyfm")
+        self.polar_state = geometry == "cylindrical"
+        self.phase_loss = config.get("phase_loss", "unit")
+        self.tau_multiplier = config.get("tau_multiplier", 1.0)
+        if not math.isfinite(self.tau_multiplier) or self.tau_multiplier <= 0:
+            raise ValueError("tau_multiplier must be positive and finite")
+        if self.phase_loss not in {"unit", "disk", "state-weighted"}:
+            raise ValueError(f"Unknown phase loss: {self.phase_loss}")
+        if self.phase_loss != "unit" and not self.polar_state:
+            raise ValueError("A separate phase loss requires cylindrical velocity coordinates")
+        if (self.phase_loss != "unit" or geometry == "warped-disk") and not self.jamendo:
+            raise ValueError("The disk experiments use the Jamendo noise and crop protocol")
         self.codec = FlowCodec(config["checkpoints"], load_backbone=False, configured_noise=self.jamendo)
         self.codec.requires_grad_(False)
-        channels = 2 if geometry == "cartesian" else 3
+        if self.phase_loss == "state-weighted":
+            calibration = config["phase_calibration"]
+            self.phase_weight_mean = calibration["mean_q"]
+            if (calibration["version"] != 1 or calibration["codebooks"] != config["codebooks"]
+                    or calibration["codec"] != self.codec.identity or calibration["floor"] != PHASE_FLOOR
+                    or calibration["tau_multiplier"] != self.tau_multiplier
+                    or not PHASE_FLOOR <= self.phase_weight_mean <= 1
+                    or (provenance and calibration["manifest_sha256"] != provenance["manifest_sha256"])):
+                raise ValueError("Phase calibration does not match this codec, manifest or weight definition")
+        channels = 3 if self.polar_state else 2
         # State + coarse condition: [B, 4 or 6, 768, padded_frames].
         if self.backbone_name == "flowdec":
             if geometry != "cartesian":
@@ -65,12 +90,12 @@ class Postfilter(pl.LightningModule):
         return coarse, condition, target, info
 
     def coordinates(self, value):
-        if self.hparams.geometry == "cartesian":
+        if not self.polar_state:
             return torch.cat((value.real, value.imag), dim=1)
         return torch.cat((value.abs(), value.angle()), dim=1)
 
     def embedding(self, state):
-        if self.hparams.geometry == "cartesian":
+        if not self.polar_state:
             return state
         amplitude, phase = state[:, :1], state[:, 1:]
         return torch.cat((amplitude, phase.cos(), phase.sin()), dim=1)
@@ -90,14 +115,8 @@ class Postfilter(pl.LightningModule):
         return self.coordinates(condition + self.codec.sigma * noise), generator
 
     def matched_start(self, condition, seeds):
-        # CPU draws match even when jobs use different CUDA devices or batch shapes.
-        noise, times = [], []
-        for seed in seeds:
-            generator = torch.Generator().manual_seed(max(seed, 0))
-            noise.append(torch.randn(condition.shape[1:], dtype=condition.dtype, generator=generator))
-            times.append(torch.rand((), generator=generator))
-        noise = torch.stack(noise).to(condition.device)
-        return self.coordinates(condition + self.codec.sigma * noise), torch.stack(times).to(condition.device)
+        start, times = matched_draw(condition, self.codec.sigma, seeds)
+        return self.coordinates(start), times
 
     def velocity_errors(self, condition, target, frames, seed=None, example_seeds=None):
         if example_seeds is None:
@@ -105,17 +124,32 @@ class Postfilter(pl.LightningModule):
             time_value = torch.rand(len(start), device=start.device, generator=generator)
         else:
             start, time_value = self.matched_start(condition, example_seeds)
-        end = self.coordinates(target)
-        velocity = end - start
-        if self.hparams.geometry == "cylindrical":
-            difference = velocity[:, 1:]
-            velocity = torch.cat((velocity[:, :1], torch.atan2(difference.sin(), difference.cos())), 1)
-        state = start + time_value[:, None, None, None] * velocity
+        t = time_value[:, None, None, None]
+        if self.hparams.geometry == "warped-disk":
+            state, velocity = warped_disk_bridge(torch.complex(start[:, :1], start[:, 1:]), target, t,
+                                                 noise_scale(self.codec.sigma, self.tau_multiplier))
+            state, velocity = self.coordinates(state), self.coordinates(velocity)
+        else:
+            velocity = self.coordinates(target) - start
+            if self.polar_state:
+                difference = velocity[:, 1:]
+                velocity = torch.cat((velocity[:, :1], torch.atan2(difference.sin(), difference.cos())), 1)
+            state = start + t * velocity
         prediction = self.velocity(state, self.embedding(self.coordinates(condition)), time_value)
         # Match the original FlowDec reduction in all five Jamendo runs.
         if not self.jamendo:
             prediction, velocity = prediction[..., :frames], velocity[..., :frames]
-        return (prediction - velocity).square().mean((2, 3))
+        errors = (prediction - velocity).square()
+        if self.phase_loss != "unit":
+            amplitude = state[:, :1, :, :frames]
+            if self.phase_loss == "disk":
+                weight = amplitude.square()
+            else:
+                tau = noise_scale(self.codec.sigma, self.tau_multiplier)
+                weight = phase_weight(amplitude, tau) / self.phase_weight_mean
+            weight = F.pad(weight, (0, errors.shape[-1] - frames), value=1.0)
+            errors = torch.cat((errors[:, :1], errors[:, 1:] * weight), dim=1)
+        return errors.mean((2, 3))
 
     def flow_loss(self, condition, target, frames, seed=None):
         errors = self.velocity_errors(condition, target, frames, seed)
@@ -143,14 +177,14 @@ class Postfilter(pl.LightningModule):
                 first = self.velocity(state, embedded, t)
                 if midpoint:
                     middle = state + 0.5 * dt * first
-                    if self.hparams.geometry == "cylindrical":
+                    if self.polar_state:
                         middle = torch.cat((middle[:, :1].clamp_min(0), middle[:, 1:]), 1)
                     first = self.velocity(middle, embedded, t + 0.5 * dt)
                 state = state + dt * first
-                if self.hparams.geometry == "cylindrical":
+                if self.polar_state:
                     phase = state[:, 1:]
                     state = torch.cat((state[:, :1].clamp_min(0), torch.atan2(phase.sin(), phase.cos())), 1)
-            if self.hparams.geometry == "cartesian":
+            if not self.polar_state:
                 spectrum = torch.complex(state[:, :1], state[:, 1:])
             else:
                 spectrum = torch.polar(state[:, :1], state[:, 1:])
@@ -331,3 +365,4 @@ class Postfilter(pl.LightningModule):
         if checkpoint["hyper_parameters"].get("provenance") != self.hparams.provenance:
             raise ValueError("Training data or experiment settings changed while resuming")
         self.fit_seconds = checkpoint.get("fit_seconds", 0.0)
+        self.checkpoint_step = checkpoint.get("global_step")

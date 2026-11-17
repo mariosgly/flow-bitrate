@@ -29,6 +29,13 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest==8.3.5"]
 labeling = ["transformers==4.51.3", "huggingface-hub==0.30.2", "safetensors==0.5.3"]
+scoring = [
+  "laion-clap==1.1.7",
+  "transformers==4.51.3",
+  "huggingface-hub==0.30.2",
+  "torchvision==0.22.1",
+  "pysepm @ git+https://github.com/cobalamin/pysepm.git@defc47219af705a7052d382717f9b34072e8fcc4",
+]
 
 [tool.setuptools]
 packages = ["flow_bitrate"]
