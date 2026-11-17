@@ -89,8 +89,10 @@ def main():
     labels = [path.parent.name for path in args.checkpoints]
     if len(set(labels)) != len(labels):
         raise ValueError("Checkpoint parent directories must have distinct run names")
-    arm_settings = {"backbone", "ema"} if jamendo else {"ema", "ema_decay"}
+    arm_settings = {"backbone", "ema", "batch_size", "accumulate"} if jamendo else {"ema", "ema_decay"}
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
+    if jamendo:
+        expected_batch = config["batch_size"] * config["accumulate"] * provenance["world_size"]
     for model_index, (checkpoint_path, label) in enumerate(zip(args.checkpoints, labels)):
         checkpoint_hash = file_hash(checkpoint_path)
         model = Postfilter.load_from_checkpoint(checkpoint_path, map_location="cpu").eval().cuda()
@@ -109,6 +111,12 @@ def main():
                        "ema_decay": settings.get("ema_decay") if model.ema_network is not None else None,
                        "ema_updates": model.ema_updates.item() if model.ema_updates is not None else 0,
                        "trainable_parameters": parameters, "fit_seconds": model.fit_seconds})
+        if jamendo:
+            effective_batch = settings["batch_size"] * settings["accumulate"] * provenance["world_size"]
+            if effective_batch != expected_batch:
+                raise ValueError("Jamendo checkpoints must have the same effective training batch size")
+            models[-1].update(batch_size_per_gpu=settings["batch_size"], accumulate=settings["accumulate"],
+                              effective_batch_size=effective_batch)
         released = FlowCodec(config["checkpoints"]).eval().cuda() if args.released and model_index == 0 else None
         if released is not None and released.identity != model.codec.identity:
             raise ValueError("Released reference must use the same NDAC and feature/noise source")

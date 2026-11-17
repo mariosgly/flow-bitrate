@@ -26,7 +26,7 @@ two EMA arms:
 mkdir -p /scratch/mg8253/flow-bitrate/logs
 sbatch --ntasks-per-node=2 --gres=gpu:2 --time=00:30:00 --job-name=jamendo-smoke-flowdec \
   slurm/postfilter_train.slurm --config configs/jamendo.json --smoke \
-  --backbone flowdec --geometry cartesian --ema
+  --backbone flowdec --geometry cartesian --ema --batch-size 4 --accumulate 8
 sbatch --ntasks-per-node=2 --gres=gpu:2 --time=00:30:00 --job-name=jamendo-smoke-cylindrical \
   slurm/postfilter_train.slurm --config configs/jamendo.json --smoke \
   --backbone cyfm --geometry cylindrical --ema
@@ -55,12 +55,14 @@ contribute no loss. All five use FlowDec's reduction over the padded STFT grid.
 
 FlowDec uses Adam at a constant `1e-4`. CyFM uses AdamW at `2e-4` with weight
 decay `1e-4` and epoch-wise cosine annealing to `1e-6`. EMA decay is `0.999`.
-The [Jamendo config](configs/jamendo.json) sets 8 crops per GPU, 2 GPUs via the
-launcher and 4 batches per optimizer update (64 crops per full update). Use
-`--accumulate 1` to update after each batch, for 16 crops per full update at
-the default batch size. Both the smoke commands and the five-run launcher
-accept `--batch-size` and `--accumulate`. Use the same values for smoke testing
-and training. Training uses bf16 mixed precision and a 40-epoch budget. Each
+The [Jamendo config](configs/jamendo.json) defaults to 8 crops per GPU and 4
+batches per optimizer update for CyFM. The launcher uses 4 crops per GPU and 8
+batches per update for FlowDec to reduce its peak memory. Both use 2 GPUs and
+64 crops per full update. Both the smoke commands and the five-run launcher
+accept `--batch-size` and `--accumulate`. For a single batch per update, use
+`--batch-size 8 --accumulate 1` for 16 crops per full update on two GPUs.
+Use the same values for smoke testing and training. Training uses bf16 mixed
+precision and a 40-epoch budget. Each
 job has an eight-hour allocation with a ten-minute stop margin. To continue a
 run in another allocation, submit the same training command with
 `--resume /absolute/path/to/last.ckpt`.
