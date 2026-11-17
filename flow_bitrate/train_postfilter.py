@@ -249,6 +249,9 @@ class SmokeCheck(Callback):
                 raise RuntimeError("EMA did not update with the optimizer")
             if not all(torch.isfinite(parameter).all() for parameter in model.ema_network.parameters()):
                 raise RuntimeError("Non-finite EMA weights")
+        if steps is not None:
+            peak = torch.cuda.max_memory_allocated(model.device) / 1024 ** 3
+            print(f"Smoke rank {trainer.global_rank}: peak allocated {peak:.2f} GiB", flush=True)
 
 
 def tiny_rows(rows):
@@ -473,11 +476,8 @@ def main():
         best = run_dir / "best.ckpt"
         if not best.is_file() or not (run_dir / "last.ckpt").is_file():
             raise RuntimeError("Smoke test did not create both best.ckpt and last.ckpt")
-    if jamendo and args.smoke:
-        peak = torch.cuda.max_memory_allocated(model.device) / 1024 ** 3
-        print(f"Smoke rank {trainer.global_rank}: peak allocated {peak:.2f} GiB", flush=True)
-        if trainer.is_global_zero:
-            print(f"SMOKE PASSED: {trainer.global_step} optimizer updates; checkpoints in {run_dir}", flush=True)
+    if jamendo and args.smoke and trainer.is_global_zero:
+        print(f"SMOKE PASSED: {trainer.global_step} optimizer updates; checkpoints in {run_dir}", flush=True)
     if legacy_smoke:
         test = AudioCrops(rows, "test", per_domain=2, seed=args.seed, seconds=config["evaluation_seconds"])
         test_loader = DataLoader(test, batch_size=config["batch_size"], num_workers=2, pin_memory=True)
