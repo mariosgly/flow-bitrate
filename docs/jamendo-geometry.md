@@ -67,7 +67,7 @@ bash scripts/submit_jamendo_geometry.sh weighted --smoke
 bash scripts/submit_jamendo_geometry.sh warped --smoke
 ```
 
-After the audit has produced the calibration and the short runs finish, these commands submit full runs. Each run keeps one `best.ckpt`, selected by the lowest six-call spectral error at validation every 1,000 optimizer updates.
+After the audit has produced the calibration and the short runs finish, these commands submit full runs. Each run keeps one rolling `last.ckpt`, saved after validation every 1,000 optimizer updates and at a graceful stop if the step has advanced.
 
 ```bash
 bash scripts/submit_jamendo_geometry.sh weighted
@@ -77,21 +77,21 @@ bash scripts/submit_jamendo_geometry.sh disk-loss
 
 If compute is limited, start with `weighted` against `cylinder`. Prioritize `warped` against `disk` when the audit shows material cancellation or the phase substitutions are audible. Use `disk-loss` against `cylinder` for the direct test of the ordinary disk's phase penalty. The warped and disk-loss arms can start independently of calibration.
 
-Existing seed-0 control checkpoints can be scored immediately. Report the saved `global_step` for each model, since its best validation score may occur at a different update. To repeat a result, pass `--seed 1` to **both** the candidate and its matching control. Reuse the fixed seed-0 calibration and evaluation cohort.
+Existing seed-0 control checkpoints can be scored immediately. Report the saved `global_step` for each model. To repeat a result, pass `--seed 1` to **both** the candidate and its matching control. Reuse the fixed seed-0 calibration and evaluation cohort.
 
-Resume a job from its saved best update with the original arm, seed and settings. For example, use `bash scripts/submit_jamendo_geometry.sh weighted --resume /path/to/run/best.ckpt`. The standard eight-hour allocation applies. Checkpoints appear under `/scratch/mg8253/flow-bitrate/runs/`.
+Resume a job from its latest saved update with the original arm, seed and settings. For example, use `bash scripts/submit_jamendo_geometry.sh weighted --resume /path/to/run/last.ckpt`. The standard eight-hour allocation applies. Checkpoints appear under `/scratch/mg8253/flow-bitrate/runs/`.
 
 ## 3. Score quality and listen
 
-Set the following shell variables to each run's `best.ckpt`.
+Set the following shell variables to the checkpoints you want to compare. The examples use the existing controls' `best.ckpt` and the new runs' `last.ckpt`.
 
 ```bash
 runs=/scratch/mg8253/flow-bitrate/runs
 disk_ckpt="$runs/<cartesian-EMA-run>/best.ckpt"
 cylinder_ckpt="$runs/<cylindrical-EMA-run>/best.ckpt"
-weighted_ckpt="$runs/<state-weighted-EMA-run>/best.ckpt"
-warped_ckpt="$runs/<warped-disk-EMA-run>/best.ckpt"
-disk_loss_ckpt="$runs/<disk-loss-EMA-run>/best.ckpt"
+weighted_ckpt="$runs/<state-weighted-EMA-run>/last.ckpt"
+warped_ckpt="$runs/<warped-disk-EMA-run>/last.ckpt"
+disk_loss_ckpt="$runs/<disk-loss-EMA-run>/last.ckpt"
 
 sbatch slurm/postfilter_evaluate.slurm --name disk-sweep-seed0 --cohort-seed 0 \
   --checkpoints "$disk_ckpt" "$cylinder_ckpt" "$weighted_ckpt" "$warped_ckpt" "$disk_loss_ckpt"

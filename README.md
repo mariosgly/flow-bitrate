@@ -34,7 +34,7 @@ sbatch --ntasks-per-node=2 --gres=gpu:2 --time=00:30:00 --job-name=jamendo-smoke
 
 Each smoke job uses the configured batch size and accumulation for three
 optimizer updates, then runs ten-second validation on two excerpts and checks
-that both checkpoints were written. Look for `SMOKE PASSED` and per-rank peak
+that `last.ckpt` was written. Look for `SMOKE PASSED` and per-rank peak
 allocated GPU memory in the Slurm output. After both pass:
 
 ```bash
@@ -65,12 +65,12 @@ Use the same values for smoke testing and training. Training uses bf16 mixed
 precision and a 40-epoch budget. Each
 job has an eight-hour allocation with a ten-minute stop margin. To continue a
 run in another allocation, submit the same training command with
-`--resume /absolute/path/to/best.ckpt`.
+`--resume /absolute/path/to/last.ckpt`.
 
 Validation runs every 1,000 optimizer updates on up to 32 fixed ten-second
 excerpts. Each excerpt passes through NDAC and the postfilter as a single input.
-Each run keeps one `best.ckpt`, selected by the lowest mean spectral error at
-six network evaluations. Resuming starts from the update saved in that file.
+Each run keeps one rolling `last.ckpt`. It is replaced after scheduled validation
+and at a graceful stop if training has reached a newer optimizer update.
 
 For FAD, SI-SDR, fwSSNR and logSpecMSE on the held-out Jamendo split, use the
 [resumable scorer](docs/jamendo-scoring.md). For a quick sweep over inference
@@ -78,11 +78,11 @@ steps with SI-SDR and the training spectral metric, use the original evaluator:
 
 ```bash
 sbatch slurm/postfilter_evaluate.slurm --name jamendo-comparison --checkpoints \
-  /path/to/flowdec-ema/best.ckpt \
-  /path/to/cyfm-cartesian-ema/best.ckpt \
-  /path/to/cyfm-cartesian-noema/best.ckpt \
-  /path/to/cyfm-cylindrical-ema/best.ckpt \
-  /path/to/cyfm-cylindrical-noema/best.ckpt
+  /path/to/flowdec-ema/last.ckpt \
+  /path/to/cyfm-cartesian-ema/last.ckpt \
+  /path/to/cyfm-cartesian-noema/last.ckpt \
+  /path/to/cyfm-cylindrical-ema/last.ckpt \
+  /path/to/cyfm-cylindrical-noema/last.ckpt
 ```
 
 The evaluator uses up to 64 fixed ten-second Jamendo test excerpts and the same

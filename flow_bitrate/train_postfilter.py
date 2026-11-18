@@ -15,7 +15,7 @@ import pytorch_lightning as pl
 import soundfile as sf
 import torch
 import torchaudio.functional as AF
-from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint, Timer
+from pytorch_lightning.callbacks import Callback, Checkpoint, LearningRateMonitor, ModelCheckpoint, Timer
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.plugins.environments import SLURMEnvironment
 from pytorch_lightning.strategies import DDPStrategy
@@ -180,17 +180,42 @@ class TrackDataLoader(DataLoader):
         self.sampler.skip = self.batches_seen * self.batch_size
 
 
-class ValidationCheckpoint(ModelCheckpoint):
+class RollingCheckpoint(Checkpoint):
+    def __init__(self, path):
+        self.path = path
+        self.saved_step = 0
+
+    def on_train_start(self, trainer, model):
+        saved_step = 0
+        if trainer.is_global_zero and self.path.is_file():
+            if trainer.ckpt_path and Path(trainer.ckpt_path).resolve() == self.path.resolve():
+                saved_step = trainer.global_step
+            else:
+                checkpoint = torch.load(self.path, map_location="cpu", weights_only=False, mmap=True)
+                saved_step = checkpoint["global_step"]
+        self.saved_step = trainer.strategy.broadcast(saved_step)
+
     def on_train_batch_end(self, trainer, model, outputs, batch, batch_idx):
         trainer.train_dataloader.batches_seen = batch_idx + 1
 
     def on_validation_end(self, trainer, model):
-        if trainer.global_step > 0 and trainer.global_step % model.hparams.config["validate_every"] == 0:
-            super().on_validation_end(trainer, model)
+        # A timed stop triggers validation before Lightning closes the partial epoch.
+        if trainer.should_stop or trainer.global_step % model.hparams.config["validate_every"] == 0:
+            self._save_if_newer(trainer)
 
     def on_train_end(self, trainer, model):
-        # Lightning otherwise has a fallback save when no validation checkpoint exists.
-        pass
+        self._save_if_newer(trainer)
+
+    def _save_if_newer(self, trainer):
+        step = trainer.global_step
+        if step <= self.saved_step:
+            return
+        staging_path = self.path.with_suffix(".ckpt.tmp")
+        trainer.save_checkpoint(staging_path)
+        if trainer.is_global_zero:
+            os.replace(staging_path, self.path)
+            print(f"Saved {self.path} at optimizer update {step}", flush=True)
+        self.saved_step = step
 
 
 class SubmissionTimer(Timer):
@@ -432,9 +457,7 @@ def main():
                            "codec": model.codec.identity,
                            "trainable_parameters": sum(p.numel() for p in model.network.parameters()),
                            "global_batch_size": config["batch_size"] * args.devices * args.nodes * config["accumulate"]})
-    callbacks = [ValidationCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
-                                      save_top_k=1, save_last=False, save_on_train_epoch_end=False,
-                                      enable_version_counter=False)] if jamendo else [
+    callbacks = [RollingCheckpoint(run_dir / "last.ckpt")] if jamendo else [
         ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
                         save_top_k=1, enable_version_counter=False),
         ModelCheckpoint(dirpath=run_dir, save_top_k=0, save_last=True,
@@ -505,9 +528,9 @@ def main():
         trainer.save_checkpoint(run_dir / "last.ckpt")
     if args.smoke:
         trainer.strategy.barrier()
-        if not (run_dir / "best.ckpt").is_file():
+        if not jamendo and not (run_dir / "best.ckpt").is_file():
             raise RuntimeError("Smoke test did not create best.ckpt")
-        if not jamendo and not (run_dir / "last.ckpt").is_file():
+        if not (run_dir / "last.ckpt").is_file():
             raise RuntimeError("Smoke test did not create last.ckpt")
     if jamendo and args.smoke and trainer.is_global_zero:
         print(f"SMOKE PASSED: {trainer.global_step} optimizer updates; checkpoints in {run_dir}", flush=True)
@@ -515,7 +538,7 @@ def main():
         test = AudioCrops(rows, "test", per_domain=2, seed=args.seed, seconds=config["evaluation_seconds"])
         test_loader = DataLoader(test, batch_size=config["batch_size"], num_workers=2, pin_memory=True)
         # This reloads the saved weights through Lightning, then runs distributed testing.
-        results = trainer.test(model, dataloaders=test_loader, ckpt_path=str(best))
+        results = trainer.test(model, dataloaders=test_loader, ckpt_path=str(run_dir / "best.ckpt"))
         if not results or not results[0] or not all(math.isfinite(float(value)) for value in results[0].values()):
             raise RuntimeError("Missing or non-finite test metrics")
         if trainer.is_global_zero:

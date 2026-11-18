@@ -1,9 +1,11 @@
 # Score saved Jamendo checkpoints
 
 Run from the `flow-bitrate` project root on HPC. Pass either the paths to
-specific checkpoint files or the run directories containing `best.ckpt`. Use
-directories for active runs. If a run has yet to produce a best checkpoint, the
-planner lists it as pending and includes the ready runs. Each plan freezes a
+specific checkpoint files or the run directories containing `last.ckpt` or
+`best.ckpt`. If both exist, the directory selects `best.ckpt`. Pass `last.ckpt`
+explicitly to score the latest state in that directory. If a run has yet to
+produce a checkpoint, the planner lists it as pending and includes the ready
+runs. Each plan freezes a
 copy of the selected checkpoint versions and records their training steps,
 hashes, and the audited Jamendo test cohort.
 
@@ -66,8 +68,8 @@ number of complete records for each checkpoint. A job ending at its time
 limit can leave unfinished work. The report requires the entire planned
 cohort and lists pending run directories separately.
 
-When a running job has a new best checkpoint, make a new plan with the same
-run directory. Its new checkpoint hash gets new results. The scorer
+When a running job updates its checkpoint, make a new plan with the same
+checkpoint path or run directory. Its new checkpoint hash gets new results. The scorer
 reuses matching records across plans, including clean reference embeddings,
 NDAC scores and unchanged checkpoints. Each completed record is published
 atomically, and file locks prevent overlapping jobs from scoring the same

@@ -74,7 +74,7 @@ def record_lock(path):
 
 
 def snapshot(source, directory):
-    """Copy a stable generation of a possibly live best.ckpt, then publish by hash."""
+    """Copy a stable version of a live checkpoint, then publish it by hash."""
     directory.mkdir(parents=True, exist_ok=True)
     for _ in range(3):
         hasher = hashlib.sha256()
@@ -136,11 +136,14 @@ def make_plan(args, root, plan_path):
     codec_identity = None
     for path in args.checkpoints:
         path = path.expanduser().resolve()
-        source = path / "best.ckpt" if path.is_dir() else path
-        if not source.is_file() and path.is_dir():
-            pending.append(str(source))
-            print(f"Awaiting first best checkpoint: {source}", flush=True)
-            continue
+        source = path
+        if path.is_dir():
+            best = path / "best.ckpt"
+            source = best if best.is_file() else path / "last.ckpt"
+            if not source.is_file():
+                pending.append(str(source))
+                print(f"Awaiting first checkpoint in {path}", flush=True)
+                continue
         sha, frozen = snapshot(source, root / "snapshots")
         if sha in models:
             continue
@@ -382,7 +385,7 @@ def main():
     parser.add_argument("--name", required=True, help="Name of an immutable evaluation plan")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Shared cache and report directory")
     parser.add_argument("--config", type=Path, default=ROOT / "configs/jamendo.json")
-    parser.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt")
+    parser.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt or last.ckpt")
     parser.add_argument("--clap-weights", type=Path, default=DEFAULT_CLAP)
     parser.add_argument("--nfe", type=int, default=6, help="Inference budget, 1 for Euler or an even midpoint budget")
     parser.add_argument("--limit", type=int, help="Use a small fixed subset when trying the pipeline")
