@@ -109,6 +109,7 @@ class CylindricalUNet(nn.Module):
         in_channels: int = 3,
         out_channels: int = 2,
         velocity_bound: Sequence[float] | None = None,
+        time_embedding_dim: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -132,7 +133,7 @@ class CylindricalUNet(nn.Module):
                 raise ValueError(f"velocity_bound must be positive, got {velocity_bound}")
             self.register_buffer("_bound", bound.reshape(1, -1, 1, 1))
 
-        time_emb_dim = base_channels * 4
+        time_emb_dim = base_channels * 4 if time_embedding_dim is None else time_embedding_dim
         self.time_mlp = nn.Sequential(
             SinusoidalPositionEmbeddings(base_channels),
             nn.Linear(base_channels, time_emb_dim),

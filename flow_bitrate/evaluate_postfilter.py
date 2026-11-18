@@ -56,6 +56,7 @@ def main():
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--per-domain", type=int)
     parser.add_argument("--nfe", type=int, nargs="+", help="Evaluate these network-call budgets")
+    parser.add_argument("--require-update", type=int, help="Require every checkpoint to contain this optimizer update")
     parser.add_argument("--cohort-seed", type=int, help="Fixed Jamendo cohort, including across training seeds")
     parser.add_argument("--listening-tracks", type=int, default=0,
                         help="Prepare a blind A/B packet for the first N Jamendo excerpts and two checkpoints")
@@ -105,7 +106,8 @@ def main():
     labels = [path.parent.name for path in args.checkpoints]
     if len(set(labels)) != len(labels):
         raise ValueError("Checkpoint parent directories must have distinct run names")
-    arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier"}
+    arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier",
+                     "width", "time_embedding_dim", "optimizer_recipe", "max_updates"}
                     if jamendo else {"ema", "ema_decay"})
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     if jamendo:
@@ -113,6 +115,8 @@ def main():
     for model_index, (checkpoint_path, label) in enumerate(zip(args.checkpoints, labels)):
         checkpoint_hash = file_hash(checkpoint_path)
         model = Postfilter.load_from_checkpoint(checkpoint_path, map_location="cpu").eval().cuda()
+        if args.require_update is not None and model.checkpoint_step != args.require_update:
+            raise ValueError(f"{label} is at optimizer update {model.checkpoint_step}; requested {args.require_update}")
         settings = model.hparams.config
         shared_settings = {key: value for key, value in settings.items() if key not in arm_settings}
         if shared_settings != expected_settings or model.hparams.provenance["manifest_sha256"] != expected_manifest:
@@ -122,7 +126,6 @@ def main():
             raise ValueError("Match sources and GPU counts. To compare different training seeds, set --cohort-seed.")
         if models and model.codec.identity != models[0]["codec"]:
             raise ValueError("Compare checkpoints with the same frozen codec and noise assets")
-        parameters = sum(p.numel() for p in model.network.parameters())
         models.append({"name": label, "backbone": model.backbone_name,
                        "geometry": model.hparams.geometry, "seed": model.hparams.seed,
                        "phase_loss": model.phase_loss, "tau_multiplier": settings.get("tau_multiplier"),
@@ -132,13 +135,16 @@ def main():
                        "evaluation_weights": "ema" if model.ema_network is not None else "raw",
                        "ema_decay": settings.get("ema_decay") if model.ema_network is not None else None,
                        "ema_updates": model.ema_updates.item() if model.ema_updates is not None else 0,
-                       "trainable_parameters": parameters, "fit_seconds": model.fit_seconds})
+                       "trainable_parameters": model.trainable_parameters, "fit_seconds": model.fit_seconds})
         if jamendo:
             effective_batch = settings["batch_size"] * settings["accumulate"] * provenance["world_size"]
             if effective_batch != expected_batch:
                 raise ValueError("Jamendo checkpoints must have the same effective training batch size")
+            cyfm = model.backbone_name == "cyfm"
             models[-1].update(batch_size_per_gpu=settings["batch_size"], accumulate=settings["accumulate"],
-                              effective_batch_size=effective_batch)
+                              effective_batch_size=effective_batch, optimizer_recipe=model.optimizer_recipe,
+                              cyfm_width=settings["width"] if cyfm else None,
+                              cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if cyfm else None)
         released = FlowCodec(config["checkpoints"]).eval().cuda() if args.released and model_index == 0 else None
         if released is not None and released.identity != model.codec.identity:
             raise ValueError("Released reference must use the same NDAC and feature/noise source")
@@ -274,7 +280,7 @@ def main():
     plt.close(fig)
     duration_note = ("Each ten-second excerpt is encoded and postfiltered in one pass." if jamendo else
                      "Ten-second test excerpts are decoded in five independent two-second blocks; waveform metrics score the concatenation.")
-    comparison_note = ("FlowDec and CyFM use their respective optimizer recipes; the geometry comparison is within CyFM."
+    comparison_note = ("Compare geometry within one CyFM capacity and optimizer. See each model's size, optimizer and step."
                        if jamendo else "Released FlowDec has a different backbone and training history; use the trained Cartesian arm to isolate geometry.")
     save_json(output / "summary.json", {"config": expected_settings if jamendo else config,
               "split": args.split, "cohort_seed": data_seed, "nfe": budgets, "models": models,

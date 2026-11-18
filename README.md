@@ -96,6 +96,68 @@ validation diagnostic, training commands and blinded listening protocol. Start w
 `bash scripts/submit_jamendo_geometry.sh audit`. The existing Cartesian and
 cylindrical CyFM EMA checkpoints serve as the two controls.
 
+### Jamendo comparison at FlowDec's parameter budget
+
+Submit one job per arm from the project root. All five CyFM arms use the Jamendo FlowDec optimizer
+(Adam, constant learning rate `1e-4`, default betas and epsilon, zero weight decay),
+EMA at `0.999`, four crops per GPU, eight accumulation batches and two GPUs.
+They follow the same crop, noise and flow-time draws for a given seed and stop at
+20,000 optimizer updates across allocations. Each has its own run directory and W&B ID.
+
+```bash
+mkdir -p /scratch/mg8253/flow-bitrate/logs
+sbatch --job-name=jamendo-large-disk      slurm/jamendo_matched.slurm disk
+sbatch --job-name=jamendo-large-cyl       slurm/jamendo_matched.slurm cylindrical
+sbatch --job-name=jamendo-large-warped    slurm/jamendo_matched.slurm warped-disk
+sbatch --job-name=jamendo-large-disk-loss slurm/jamendo_matched.slurm disk-loss
+sbatch --job-name=jamendo-large-weighted  slurm/jamendo_matched.slurm weighted
+```
+
+The CyFM spatial width is 160 and the time-conditioning width is 910. These
+widths give 23,703,362 trainable parameters in Cartesian coordinates and
+23,706,242 in cylindrical coordinates. The pinned NCSN++ has 23,703,640.
+Counts cover the learned postfilter and exclude the frozen codec, EMA copy and
+frozen Fourier features. The extra 2,880 cylindrical weights are in the input convolution.
+
+The ordinary Euclidean disk uses the straight Cartesian chord. `disk` and
+`cartesian` select exactly the same training recipe. If the matched large Cartesian
+and cylindrical jobs are already running, submit only the last three commands.
+
+| Candidate | Matched control | What changes |
+| --- | --- | --- |
+| `cylindrical` | `disk` | The network learns magnitude and shortest-arc phase velocities. |
+| `warped-disk` | `disk` | The training path can cross zero for weak opposite-phase bins and bend around it for strong ones. Both runs use Cartesian inputs, velocities, MSE and sampler. |
+| `disk-loss` | `cylindrical` | The cylindrical path stays fixed. Squared phase-velocity error is weighted by squared current magnitude. |
+| `weighted` | `cylindrical` | The same phase error receives a bounded weight based on current magnitude and the codec's frequency-dependent noise scale. |
+
+`weighted` reads the audit's `/scratch/mg8253/flow-bitrate/jamendo-geometry/calibration.json`.
+If the audit was saved elsewhere, append `--phase-calibration /path/to/calibration.json`
+to its command. The other arms can run independently of the audit.
+
+Compare large Cartesian CyFM with Cartesian FlowDec to measure
+the effect of backbone choice at matched size and optimizer. Use a saved FlowDec
+checkpoint at the same update. If one is unavailable, submit
+`sbatch --job-name=jamendo-ref-20k slurm/jamendo_matched.slurm flowdec`.
+Prefix any CyFM arm with `small-` for a width-64 control with the same Adam recipe
+and update budget, for example `small-warped-disk` or `small-disk-loss`.
+
+For a three-update smoke run, add `--time=00:30:00` before the Slurm filename
+and `--smoke` after the arm. To continue an eight-hour allocation, resubmit the
+same arm and seed with `--resume /path/to/run/last.ckpt`. Keep both geometries
+on the same GPU type and repeat the pair with `--seed 1` for confirmation.
+
+```bash
+sbatch slurm/postfilter_evaluate.slurm --name matched-20k-seed0 --cohort-seed 0 \
+  --require-update 20000 --nfe 6 24 --checkpoints \
+  /path/to/flowdec/last.ckpt /path/to/large-disk/last.ckpt /path/to/large-cyl/last.ckpt \
+  /path/to/large-warped/last.ckpt /path/to/large-disk-loss/last.ckpt /path/to/large-weighted/last.ckpt
+```
+
+Pass distinct run directories' checkpoint files. The evaluator records parameter
+counts, optimizer recipes, steps, fit time and postfilter time. The full-cohort
+scoring planner also accepts `--require-update 20000`. For blinded listening,
+pass one candidate and its matched control from the table together with `--listening-tracks 8`.
+
 ## Train the mixed-dataset postfilters
 
 Same pretrained NDAC, same CyFM U-Net, Cartesian or cylindrical flow matching. NDAC stays frozen; both postfilters train from scratch at 4.5 kbps.

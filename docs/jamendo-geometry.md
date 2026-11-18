@@ -58,7 +58,10 @@ This uses one GPU. It estimates `mean_q` once from 128 deterministically selecte
 
 A high bin count alongside a small energy share suggests examining quiet tails. A substantial energy share in weak-coarse/strong-clean bins makes missing attacks and harmonics a priority for the listening comparison. The substituted-phase audio helps distinguish these cases. To try another transition scale, give the audit a distinct output, for example `audit --tau-multiplier 2 --output /scratch/mg8253/flow-bitrate/jamendo-geometry-tau2`. Pass its `calibration.json` to `weighted --phase-calibration ...` and use `warped --tau-multiplier 2` for the corresponding bridge.
 
-## 2. Train the matched arms
+## 2. Train the width-64 arms
+
+For the same five geometries and loss choices at FlowDec's 23.7M-parameter budget,
+use the [large-model Slurm commands and comparison table](../README.md#jamendo-comparison-at-flowdecs-parameter-budget).
 
 Use **CyFM EMA** controls trained with the same seed, effective batch and update count. The launcher defaults to seed 0, two GPUs and the original Jamendo optimizer, crop and noise protocols. The FlowDec NCSN++ EMA run remains a separate reference for complete decoder recipes.
 

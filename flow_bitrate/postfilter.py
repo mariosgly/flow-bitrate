@@ -27,6 +27,7 @@ class Postfilter(pl.LightningModule):
         self.save_hyperparameters()
         self.jamendo = config.get("dataset") == "jamendo"
         self.backbone_name = config.get("backbone", "cyfm")
+        self.optimizer_recipe = config.get("optimizer_recipe", self.backbone_name)
         self.polar_state = geometry == "cylindrical"
         self.phase_loss = config.get("phase_loss", "unit")
         self.tau_multiplier = config.get("tau_multiplier", 1.0)
@@ -57,7 +58,8 @@ class Postfilter(pl.LightningModule):
             self.network = flowdec_backbone()
         else:
             self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
-                                           out_channels=2, velocity_bound=None)
+                                           out_channels=2, velocity_bound=None,
+                                           time_embedding_dim=config.get("time_embedding_dim"))
         self.ema_network = copy.deepcopy(self.network).requires_grad_(False) if config.get("ema", False) else None
         self.register_buffer("ema_updates", torch.zeros((), dtype=torch.long) if self.ema_network is not None else None)
         if not 0 < config.get("ema_decay", 0.999) < 1:
@@ -327,8 +329,12 @@ class Postfilter(pl.LightningModule):
         peak = torch.cuda.max_memory_allocated(self.device) / 1024 ** 3
         self.log("test/gpu_peak_allocated_gb", peak, sync_dist=True, reduce_fx="max", batch_size=1)
 
+    @property
+    def trainable_parameters(self):
+        return sum(p.numel() for p in self.network.parameters() if p.requires_grad)
+
     def configure_optimizers(self):
-        if self.backbone_name == "flowdec":
+        if self.optimizer_recipe == "flowdec":
             return torch.optim.Adam(self.network.parameters(), lr=1e-4)
         if self.jamendo:
             optimizer = torch.optim.AdamW(self.network.parameters(), lr=2e-4, weight_decay=1e-4)
@@ -356,6 +362,7 @@ class Postfilter(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["source_codec"] = self.codec.identity
+        checkpoint["trainable_parameters"] = self.trainable_parameters
         checkpoint["evaluation_weights"] = "ema" if self.ema_network is not None else "raw"
         checkpoint["fit_seconds"] = self.fit_seconds + (time.monotonic() - self.started if self.started else 0)
 

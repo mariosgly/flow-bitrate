@@ -141,6 +141,8 @@ def make_plan(args, root, plan_path):
             best = path / "best.ckpt"
             source = best if best.is_file() else path / "last.ckpt"
             if not source.is_file():
+                if args.require_update is not None:
+                    raise FileNotFoundError(f"No checkpoint at requested optimizer update {args.require_update}: {path}")
                 pending.append(str(source))
                 print(f"Awaiting first checkpoint in {path}", flush=True)
                 continue
@@ -148,6 +150,8 @@ def make_plan(args, root, plan_path):
         if sha in models:
             continue
         saved = torch.load(frozen, map_location="cpu", weights_only=False)
+        if args.require_update is not None and saved["global_step"] != args.require_update:
+            raise ValueError(f"{source} is at optimizer update {saved['global_step']}; requested {args.require_update}")
         hparams = saved["hyper_parameters"]
         settings = hparams["config"]
         if (settings.get("dataset") != "jamendo" or settings["codebooks"] != 6
@@ -158,9 +162,15 @@ def make_plan(args, root, plan_path):
         if codec_identity is not None and identity != codec_identity:
             raise ValueError("Checkpoints must use the same frozen codec and FlowDec noise curve")
         codec_identity = identity
+        backbone = settings.get("backbone", "cyfm")
         models[sha] = dict(source=str(source), snapshot=frozen.name, sha256=sha,
                            method=f"{source.parent.name}/{source.stem}", step=saved["global_step"],
-                           backbone=settings.get("backbone", "cyfm"), geometry=hparams["geometry"],
+                           backbone=backbone, geometry=hparams["geometry"],
+                           cyfm_width=settings["width"] if backbone == "cyfm" else None,
+                           cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if backbone == "cyfm" else None,
+                           optimizer_recipe=settings.get("optimizer_recipe", backbone),
+                           trainable_parameters=saved.get("trainable_parameters"), fit_seconds=saved.get("fit_seconds"),
+                           training_gpus=hparams["provenance"]["world_size"],
                            weights=saved["evaluation_weights"], training_seed=hparams["seed"],
                            phase_loss=settings.get("phase_loss", "unit"), tau_multiplier=settings.get("tau_multiplier"),
                            phase_weight_mean=settings.get("phase_calibration", {}).get("mean_q"))
@@ -389,6 +399,7 @@ def main():
     parser.add_argument("--clap-weights", type=Path, default=DEFAULT_CLAP)
     parser.add_argument("--nfe", type=int, default=6, help="Inference budget, 1 for Euler or an even midpoint budget")
     parser.add_argument("--limit", type=int, help="Use a small fixed subset when trying the pipeline")
+    parser.add_argument("--require-update", type=int, help="When planning, require this optimizer update for all checkpoints")
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--shard", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     parser.add_argument("--device", default="cuda")
@@ -408,6 +419,8 @@ def main():
             parser.error("--limit must be at least two")
         make_plan(args, root, plan_path)
     else:
+        if args.require_update is not None:
+            parser.error("--require-update applies when creating a plan")
         plan = read_json(plan_path)
         if plan["protocol"]["version"] != PROTOCOL_VERSION:
             parser.error("This plan uses a different scoring protocol")

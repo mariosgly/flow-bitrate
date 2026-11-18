@@ -300,6 +300,9 @@ def main():
     parser.add_argument("--phase-calibration", type=Path, help="Training-split calibration.json for state-weighted loss")
     parser.add_argument("--tau-multiplier", type=float, help="Transition scale in multiples of FlowDec's noise scale")
     parser.add_argument("--backbone", choices=("flowdec", "cyfm"))
+    parser.add_argument("--flowdec-match", choices=("capacity", "optimizer"),
+                        help="Fresh 20,000-update Jamendo comparison with FlowDec Adam and EMA. "
+                             "Capacity also scales the CyFM U-Net to the FlowDec parameter budget.")
     parser.add_argument("--batch-size", type=int, help="Jamendo crops per GPU per forward pass")
     parser.add_argument("--accumulate", type=int, help="Jamendo batches per optimizer update")
     parser.add_argument("--seed", type=int, default=0)
@@ -339,10 +342,15 @@ def main():
         if args.tau_multiplier is None:
             config["tau_multiplier"] = config["phase_calibration"]["tau_multiplier"]
     legacy_smoke = args.smoke and not jamendo
-    if not jamendo and any(value is not None for value in (args.backbone, args.batch_size, args.accumulate)):
-        parser.error("--backbone, --batch-size and --accumulate are for the Jamendo experiment")
+    if not jamendo and any(value is not None for value in (args.backbone, args.batch_size, args.accumulate, args.flowdec_match)):
+        parser.error("--backbone, --batch-size, --accumulate and --flowdec-match are for the Jamendo experiment")
     if jamendo:
         config["backbone"] = args.backbone or "cyfm"
+        if args.flowdec_match:
+            config.update(optimizer_recipe="flowdec", max_updates=20_000, ema=True, batch_size=4, accumulate=8)
+            if args.flowdec_match == "capacity" and config["backbone"] == "cyfm":
+                # Closest shared time width at spatial width 160 for the pinned NCSN++ count.
+                config.update(width=160, time_embedding_dim=910)
         if args.batch_size is not None:
             config["batch_size"] = args.batch_size
         if args.accumulate is not None:
@@ -427,6 +435,9 @@ def main():
     averaging = "ema" if config.get("ema", False) else "noema"
     prefix = ("smoke-" if args.smoke else "") + (f"jamendo-{config['backbone']}-" if jamendo else "")
     arm = args.geometry if args.phase_loss == "unit" else f"{args.geometry}-{args.phase_loss}"
+    if args.flowdec_match:
+        model_size = f"w{config['width']}" if config["backbone"] == "cyfm" else "ncsnpp"
+        arm = f"{arm}-{model_size}-adam-20k"
     label = args.name or f"{prefix}{arm}-{averaging}-k{config['codebooks']}-seed{args.seed}"
     if Path(label).name != label or label in {".", ".."}:
         raise ValueError("--name must be a folder name")
@@ -455,7 +466,7 @@ def main():
                          save_dir=config["wandb_dir"], log_model=False)
     logger.log_hyperparams({"experiment": config, "geometry": args.geometry, "seed": args.seed,
                            "codec": model.codec.identity,
-                           "trainable_parameters": sum(p.numel() for p in model.network.parameters()),
+                           "trainable_parameters": model.trainable_parameters, "optimizer_recipe": model.optimizer_recipe,
                            "global_batch_size": config["batch_size"] * args.devices * args.nodes * config["accumulate"]})
     callbacks = [RollingCheckpoint(run_dir / "last.ckpt")] if jamendo else [
         ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
@@ -490,7 +501,7 @@ def main():
                             **loader_options),
             DataLoader(valid, batch_size=1, sampler=TrackSampler(valid, rank, world_size), **loader_options),
         ]
-        if len(loaders[0]) // accumulate * config["max_epochs"] < config["validate_every"]:
+        if "max_updates" not in config and len(loaders[0]) // accumulate * config["max_epochs"] < config["validate_every"]:
             raise ValueError("The epoch budget must reach at least one scheduled validation")
     else:
         loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0, drop_last=index == 0,
@@ -499,8 +510,8 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=args.nodes,
         strategy=DDPStrategy(find_unused_parameters=False) if args.devices * args.nodes > 1 else "auto",
-        precision=config["precision"], max_steps=config.get("jamendo_smoke_steps", -1),
-        max_epochs=config["max_epochs"] if jamendo or args.smoke else -1,
+        precision=config["precision"], max_steps=config.get("jamendo_smoke_steps", config.get("max_updates", -1)),
+        max_epochs=config["max_epochs"] if (jamendo or args.smoke) and "max_updates" not in config else -1,
         accumulate_grad_batches=config["accumulate"], gradient_clip_val=None if jamendo else 1.0,
         val_check_interval=1.0 if legacy_smoke else config["validate_every"] * config["accumulate"],
         check_val_every_n_epoch=1 if legacy_smoke else None,
