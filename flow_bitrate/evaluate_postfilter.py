@@ -51,7 +51,9 @@ def save_json(path, value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoints", type=Path, nargs="+", required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--checkpoints", type=Path, nargs="+")
+    inputs.add_argument("--score-plan", type=Path, help="Jamendo plan.json with frozen checkpoints and test tracks")
     parser.add_argument("--name", default="postfilter-comparison")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--per-domain", type=int)
@@ -60,21 +62,46 @@ def main():
     parser.add_argument("--cohort-seed", type=int, help="Fixed Jamendo cohort, including across training seeds")
     parser.add_argument("--listening-tracks", type=int, default=0,
                         help="Prepare a blind A/B packet for the first N Jamendo excerpts and two checkpoints")
+    parser.add_argument("--export-audio-tracks", type=int,
+                        help="Save labeled WAVs for the first N excerpts for every model (default: one per domain)")
     parser.add_argument("--released", action="store_true", help="also measure the released FlowDec-75m")
     args = parser.parse_args()
     if Path(args.name).name != args.name or args.name in {".", ".."}:
         raise ValueError("--name must be a folder name")
-    first = torch.load(args.checkpoints[0], map_location="cpu", weights_only=False)
+    if args.export_audio_tracks is not None and args.export_audio_tracks < 0:
+        parser.error("--export-audio-tracks must be nonnegative")
+    score_plan = None
+    if args.score_plan is not None:
+        plan_path = args.score_plan.resolve()
+        score_plan = json.loads(plan_path.read_text())
+        snapshots = plan_path.parent.parent.parent / "snapshots"
+        checkpoints = [snapshots / model["snapshot"] for model in score_plan["models"]]
+        labels = [f"{Path(model['source']).parent.name}-{model['sha256'][:12]}" for model in score_plan["models"]]
+        if not checkpoints:
+            parser.error("The scoring plan contains no frozen checkpoints")
+    else:
+        checkpoints = args.checkpoints
+        labels = [path.parent.name for path in checkpoints]
+    first = torch.load(checkpoints[0], map_location="cpu", weights_only=False)
     config = first["hyper_parameters"]["config"]
     provenance = first["hyper_parameters"]["provenance"]
     expected_manifest = provenance["manifest_sha256"]
     training_seed = first["hyper_parameters"]["seed"]
     del first
     jamendo = config.get("dataset") == "jamendo"
-    budgets = args.nfe if args.nfe is not None else config["evaluation_nfe"]
-    if len(set(budgets)) != len(budgets) or any(n < 1 or (config["solver"] == "midpoint" and n != 1 and n % 2) for n in budgets):
+    solver = config["solver"]
+    noise_seeds = config["evaluation_seeds"]
+    default_budgets = config["evaluation_nfe"]
+    if score_plan is not None:
+        if not jamendo or args.split != "test" or score_plan["manifest_sha256"] != expected_manifest:
+            parser.error("--score-plan requires Jamendo test checkpoints on the plan's manifest")
+        solver = score_plan["solver"]
+        noise_seeds = score_plan["seeds"]
+        default_budgets = [score_plan["nfe"]]
+    budgets = args.nfe if args.nfe is not None else default_budgets
+    if len(set(budgets)) != len(budgets) or any(n < 1 or (solver == "midpoint" and n != 1 and n % 2) for n in budgets):
         parser.error("Use distinct positive NFE budgets; midpoint accepts one or even budgets")
-    if args.listening_tracks < 0 or (args.listening_tracks and (not jamendo or len(args.checkpoints) != 2)):
+    if args.listening_tracks < 0 or (args.listening_tracks and (not jamendo or len(checkpoints) != 2)):
         parser.error("--listening-tracks requires two Jamendo checkpoints and a nonnegative count")
     if args.cohort_seed is not None and not jamendo:
         parser.error("--cohort-seed is for Jamendo")
@@ -82,7 +109,7 @@ def main():
         parser.error("Pass the scratch-trained FlowDec checkpoint for the Jamendo comparison")
     if file_hash(config["manifest"]) != expected_manifest:
         raise ValueError("The training manifest changed; restore its original split definitions")
-    rows = read_manifest(config["manifest"], dataset=config.get("dataset"))
+    rows = score_plan["tracks"] if score_plan is not None else read_manifest(config["manifest"], dataset=config.get("dataset"))
     count_key = "validation_per_domain" if jamendo and args.split == "val" else "test_per_domain"
     per_domain = args.per_domain if args.per_domain is not None else config[count_key]
     if per_domain < 1:
@@ -90,7 +117,7 @@ def main():
     duration = config.get("evaluation_seconds", 2) if jamendo or args.split == "test" else 2
     if duration < 2 or duration % 2:
         raise ValueError("Evaluation duration must be a positive multiple of two seconds")
-    data_seed = training_seed if jamendo else 0
+    data_seed = training_seed if jamendo and score_plan is None else 0
     if args.cohort_seed is not None:
         data_seed = args.cohort_seed
     crop_type = JamendoCrops if jamendo else AudioCrops
@@ -103,17 +130,18 @@ def main():
     audio_dir.mkdir(parents=True, exist_ok=True)
     all_rows, models = [], []
     blind_sources = {}
-    labels = [path.parent.name for path in args.checkpoints]
     if len(set(labels)) != len(labels):
-        raise ValueError("Checkpoint parent directories must have distinct run names")
+        raise ValueError("Checkpoints must have distinct run labels")
     arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier",
                      "width", "time_embedding_dim", "optimizer_recipe", "max_updates"}
                     if jamendo else {"ema", "ema_decay"})
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     if jamendo:
         expected_batch = config["batch_size"] * config["accumulate"] * provenance["world_size"]
-    for model_index, (checkpoint_path, label) in enumerate(zip(args.checkpoints, labels)):
+    for model_index, (checkpoint_path, label) in enumerate(zip(checkpoints, labels)):
         checkpoint_hash = file_hash(checkpoint_path)
+        if score_plan is not None and checkpoint_hash != score_plan["models"][model_index]["sha256"]:
+            raise ValueError(f"Frozen checkpoint does not match the scoring plan: {checkpoint_path}")
         model = Postfilter.load_from_checkpoint(checkpoint_path, map_location="cpu").eval().cuda()
         if args.require_update is not None and model.checkpoint_step != args.require_update:
             raise ValueError(f"{label} is at optimizer update {model.checkpoint_step}; requested {args.require_update}")
@@ -156,20 +184,28 @@ def main():
                 raise ValueError(f"Audio changed since its decode audit: {row['path']}")
             domain = row.get("domain") or "audio"
             export_audio = domain not in examples
+            if args.export_audio_tracks is not None:
+                export_audio = index < args.export_audio_tracks
             examples.add(domain)
             identity = {"checkpoint": checkpoint_hash, "model": label, "index": index, "source": row,
                         "source_size": stat.st_size, "source_mtime": stat.st_mtime_ns,
                         "split": args.split, "data_seed": data_seed, "seconds": duration, "released": released is not None,
-                        "whole_excerpt": jamendo, "include_ndac": model_index == 0, "solver": config["solver"],
-                        "nfe": budgets, "noise_seeds": config["evaluation_seeds"]}
+                        "whole_excerpt": jamendo, "include_ndac": model_index == 0, "solver": solver,
+                        "nfe": budgets, "noise_seeds": noise_seeds}
             key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
             record_path = cache / f"{key}.json"
             listening = index < args.listening_tracks
             required_wavs = []
+            if export_audio:
+                exported_models = (label, "released_flowdec") if released is not None else (label,)
+                required_wavs.extend(audio_dir / f"{index:05d}_{name}_nfe{n}.wav"
+                                     for name in exported_models for n in budgets)
+                if model_index == 0:
+                    required_wavs.extend(audio_dir / f"{index:05d}_{tag}.wav" for tag in ("original", "ndac"))
             if listening:
                 clip_dir = cache / f"{key}-audio"
                 blind_sources[index, label] = clip_dir
-                required_wavs = [clip_dir / f"nfe{n}.wav" for n in budgets]
+                required_wavs.extend(clip_dir / f"nfe{n}.wav" for n in budgets)
                 if model_index == 0:
                     required_wavs.extend([clip_dir / "reference.wav", clip_dir / "ndac.wav"])
             if record_path.exists() and all(path.is_file() for path in required_wavs):
@@ -204,14 +240,14 @@ def main():
                                 released_enhance(released, coarse, nfe, seed, solver)))
             for method_name, enhance in methods:
                 # Warm up on each source before collecting decoder timings.
-                enhance(coarse_blocks[0], 1, 0, config["solver"])
+                enhance(coarse_blocks[0], 1, 0, solver)
                 for nfe in budgets:
                     errors, scores, seconds = [], [], []
-                    for noise_index, sample_seed in enumerate(config["evaluation_seeds"]):
+                    for noise_index, sample_seed in enumerate(noise_seeds):
                         seed = matched_seed("evaluation", track, sample_seed) if jamendo else 1000000 + 100 * index + sample_seed
                         torch.cuda.synchronize()
                         start = time.perf_counter()
-                        reconstruction = torch.cat([enhance(block, nfe, seed + block_index * 10007, config["solver"])
+                        reconstruction = torch.cat([enhance(block, nfe, seed + block_index * 10007, solver)
                                                     for block_index, block in enumerate(coarse_blocks)], dim=-1)
                         torch.cuda.synchronize()
                         seconds.append(time.perf_counter() - start)
@@ -242,7 +278,7 @@ def main():
         artist_reports(output, paired, ("spectral", "si_sdr"))
     if args.listening_tracks:
         packet = blind_packet(output, data.rows[:args.listening_tracks], blind_sources, models, budgets,
-                              config["evaluation_seeds"][0])
+                              noise_seeds[0])
         print(f"Blind listening packet: {packet / 'listener'}")
     summary, by_dataset = [], []
     for field, destination in (("domain", summary), ("dataset", by_dataset)):
