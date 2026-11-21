@@ -10,9 +10,11 @@ import soundfile as sf
 import torch
 import torch.nn.functional as F
 
+from .ablation_models import BandSplitVelocity, reduced_ncsnpp
 from .codec import BLOCK_SAMPLES, CODEBOOKS, SAMPLE_RATE, FlowCodec, flowdec_backbone
 from .cyfm_unet import CylindricalUNet
 from .data import matched_seed
+from .jamendo_ablation import wsd_factor
 from .metrics import si_sdr, spectral_loss
 from .phase_geometry import PHASE_FLOOR, matched_draw, noise_scale, phase_weight, warped_disk_bridge
 
@@ -41,6 +43,7 @@ class Postfilter(pl.LightningModule):
             raise ValueError("The disk experiments use the Jamendo noise and crop protocol")
         self.codec = FlowCodec(config["checkpoints"], load_backbone=False, configured_noise=self.jamendo)
         self.codec.requires_grad_(False)
+        self.register_buffer("start_sigma", self.ablation_sigma(config, seed, provenance), persistent=False)
         if self.phase_loss == "state-weighted":
             calibration = config["phase_calibration"]
             self.phase_weight_mean = calibration["mean_q"]
@@ -51,15 +54,21 @@ class Postfilter(pl.LightningModule):
                     or (provenance and calibration["manifest_sha256"] != provenance["manifest_sha256"])):
                 raise ValueError("Phase calibration does not match this codec, manifest or weight definition")
         channels = 3 if self.polar_state else 2
+        architecture = config.get("architecture", "unet")
         # State + coarse condition: [B, 4 or 6, 768, padded_frames].
         if self.backbone_name == "flowdec":
             if geometry != "cartesian":
                 raise ValueError("The original FlowDec backbone requires Cartesian inputs")
             self.network = flowdec_backbone()
+        elif architecture == "ncsnpp":
+            self.network = reduced_ncsnpp(2 * channels)
+        elif architecture in {"band-tcn", "band-attention"}:
+            self.network = BandSplitVelocity(2 * channels, attention=architecture == "band-attention")
         else:
             self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
                                            out_channels=2, velocity_bound=None,
-                                           time_embedding_dim=config.get("time_embedding_dim"))
+                                           time_embedding_dim=config.get("time_embedding_dim"),
+                                           variant=architecture)
         self.ema_network = copy.deepcopy(self.network).requires_grad_(False) if config.get("ema", False) else None
         self.register_buffer("ema_updates", torch.zeros((), dtype=torch.long) if self.ema_network is not None else None)
         if not 0 < config.get("ema_decay", 0.999) < 1:
@@ -67,6 +76,30 @@ class Postfilter(pl.LightningModule):
         self.rate_index = CODEBOOKS.index(config["codebooks"])
         self.fit_seconds = 0.0
         self.started = None
+
+    def ablation_sigma(self, config, seed, provenance):
+        noise = config.get("start_noise", "original")
+        sigma = self.codec.sigma
+        if noise == "original":
+            return None
+        if noise == "flat-rms":
+            value = sigma.square().mean().sqrt().expand_as(sigma).clone()
+        elif noise.startswith("scale:"):
+            value = sigma * float(noise.split(":")[1])
+        elif noise.startswith("flat:"):
+            value = torch.full_like(sigma, float(noise.split(":")[1]))
+        elif noise in {"jamendo-raw", "jamendo-matched"}:
+            calibration = config["noise_calibration"]
+            if (calibration.get("version") != 1 or calibration["codec"] != self.codec.identity
+                    or calibration["seed"] != seed or calibration["codebooks"] != config["codebooks"]
+                    or (provenance and calibration["manifest_sha256"] != provenance["manifest_sha256"])):
+                raise ValueError("Start-noise calibration does not match the training data and codec")
+            value = torch.tensor(calibration[noise.removeprefix("jamendo-")], dtype=sigma.dtype)[:, None]
+        else:
+            raise ValueError(f"Unknown start noise: {noise}")
+        if value.shape != sigma.shape or not torch.isfinite(value).all() or (value <= 0).any():
+            raise ValueError("Expected a positive finite start-noise scale for each frequency")
+        return value
 
     def train(self, mode=True):
         super().train(mode)
@@ -85,8 +118,9 @@ class Postfilter(pl.LightningModule):
         return coarse
 
     @torch.no_grad()
-    def prepare(self, audio):
-        coarse = self.coarse_audio(audio)
+    def prepare(self, audio, coarse=None):
+        if coarse is None:
+            coarse = self.coarse_audio(audio)
         with torch.autocast(device_type=audio.device.type, enabled=False):
             condition, target, info = self.codec.preprocess(coarse, audio.float())
         return coarse, condition, target, info
@@ -114,10 +148,12 @@ class Postfilter(pl.LightningModule):
     def start(self, condition, seed=None):
         generator = None if seed is None else torch.Generator(device=condition.device).manual_seed(seed)
         noise = torch.randn(condition.shape, dtype=condition.dtype, device=condition.device, generator=generator)
-        return self.coordinates(condition + self.codec.sigma * noise), generator
+        sigma = self.codec.sigma if self.start_sigma is None else self.start_sigma
+        return self.coordinates(condition + sigma * noise), generator
 
     def matched_start(self, condition, seeds):
-        start, times = matched_draw(condition, self.codec.sigma, seeds)
+        sigma = self.codec.sigma if self.start_sigma is None else self.start_sigma
+        start, times = matched_draw(condition, sigma, seeds)
         return self.coordinates(start), times
 
     def velocity_errors(self, condition, target, frames, seed=None, example_seeds=None):
@@ -197,8 +233,12 @@ class Postfilter(pl.LightningModule):
 
     def training_step(self, audio, batch_idx):
         if self.jamendo:
-            audio, seeds = audio
-            _, condition, target, info = self.prepare(audio)
+            if len(audio) == 3:
+                audio, coarse, seeds = audio
+            else:
+                audio, seeds = audio
+                coarse = None
+            _, condition, target, info = self.prepare(audio, coarse)
             errors = self.velocity_errors(condition, target, info[1], example_seeds=seeds.tolist())
             loss_sum = errors.masked_fill(seeds[:, None] < 0, 0).sum()
             loader = self.trainer.train_dataloader
@@ -280,6 +320,8 @@ class Postfilter(pl.LightningModule):
             return
         totals = self.trainer.strategy.reduce(self.validation_totals, reduce_op="sum")
         self.log("val/ndac_spectral", totals[0, 0] / totals[0, 1])
+        if self.hparams.config.get("ablation_arm"):
+            self.log("val/crop_slots", float(self.global_step * self.hparams.config["effective_batch"]))
         count = totals[0, 1] * len(config["evaluation_seeds"])
         for index, nfe in enumerate(config["validation_nfe"], start=1):
             spectral, sdr = totals[index] / count
@@ -338,6 +380,10 @@ class Postfilter(pl.LightningModule):
             return torch.optim.Adam(self.network.parameters(), lr=1e-4)
         if self.jamendo:
             optimizer = torch.optim.AdamW(self.network.parameters(), lr=2e-4, weight_decay=1e-4)
+            if self.hparams.config.get("schedule") == "wsd":
+                batch = self.hparams.config["effective_batch"]
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: wsd_factor(step, batch))
+                return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=self.hparams.config["max_epochs"], eta_min=1e-6
             )

@@ -31,7 +31,12 @@ def matched_seed(*parts):
     return int.from_bytes(digest[:8], "big") % (1 << 63)
 
 
-def read_manifest(path, dataset=None):
+def jamendo_track_order(size, seed, epoch):
+    generator = torch.Generator().manual_seed(matched_seed("order", seed, epoch))
+    return torch.randperm(size, generator=generator)
+
+
+def read_manifest(path, dataset=None, *, check_files=True):
     path = Path(path)
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -43,7 +48,8 @@ def read_manifest(path, dataset=None):
             raise ValueError(f"No {dataset} tracks in {path}")
     groups, seen = {}, set()
     for row in rows:
-        row["path"] = str((path.parent / row["path"]).resolve())
+        source = path.parent / row["path"]
+        row["path"] = str(source.resolve() if check_files else source.absolute())
         if row["split"] not in {"train", "val", "test"} or not row["group"]:
             raise ValueError(f"Bad split/group: {row}")
         if row["path"] in seen:
@@ -51,7 +57,7 @@ def read_manifest(path, dataset=None):
         seen.add(row["path"])
         if groups.setdefault(row["group"], row["split"]) != row["split"]:
             raise ValueError(f"Group leaks across splits: {row['group']}")
-        if not Path(row["path"]).is_file():
+        if check_files and not Path(row["path"]).is_file():
             raise FileNotFoundError(row["path"])
     return rows
 

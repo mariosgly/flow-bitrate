@@ -12,6 +12,7 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import math
 
@@ -58,13 +59,16 @@ class TimeConditionedBlock(nn.Module):
         time_emb_dim: Dimension of time embedding vector.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int, time_emb_dim: int,
+                 *, film=False, time_dilation=1) -> None:
         super().__init__()
-        self.time_mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, out_channels))
+        self.film = film
+        self.time_mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, out_channels * (2 if film else 1)))
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(8, out_channels)
 
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                               padding=(1, time_dilation), dilation=(1, time_dilation))
         self.norm2 = nn.GroupNorm(8, out_channels)
 
         self.silu = nn.SiLU()
@@ -86,12 +90,32 @@ class TimeConditionedBlock(nn.Module):
         # Time injection (broadcasting over H and W dimensions)
         time_info = self.time_mlp(t_emb)
         time_info = time_info.unsqueeze(-1).unsqueeze(-1)
-        h = h + time_info
+        if self.film:
+            scale, shift = time_info.chunk(2, dim=1)
+            h = h * (1 + scale) + shift
+        else:
+            h = h + time_info
 
         h = self.conv2(h)
         h = self.norm2(h)
 
         return self.silu(h + self.residual(x))
+
+
+class DepthwiseResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, time_emb_dim):
+        super().__init__()
+        self.project = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.depthwise = nn.Conv2d(out_channels, out_channels, 7, padding=3, groups=out_channels)
+        self.norm = nn.GroupNorm(8, out_channels)
+        self.time = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, out_channels))
+        self.mlp = nn.Sequential(nn.Conv2d(out_channels, 4 * out_channels, 1), nn.GELU(),
+                                 nn.Conv2d(4 * out_channels, out_channels, 1))
+
+    def forward(self, x, time):
+        x = self.project(x)
+        h = self.norm(self.depthwise(x)) + self.time(time)[:, :, None, None]
+        return x + self.mlp(h)
 
 
 class CylindricalUNet(nn.Module):
@@ -110,6 +134,7 @@ class CylindricalUNet(nn.Module):
         out_channels: int = 2,
         velocity_bound: Sequence[float] | None = None,
         time_embedding_dim: int | None = None,
+        variant: str = "unet",
     ) -> None:
         super().__init__()
 
@@ -141,27 +166,41 @@ class CylindricalUNet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim),
         )
 
-        # ENCODER (Downsampling, extracting global context)
-        self.down1 = TimeConditionedBlock(base_channels, base_channels * 2, time_emb_dim)
-        self.pool1 = nn.MaxPool2d(2)
+        def block(in_width, out_width, time_dilation=1):
+            if variant == "convnext":
+                return DepthwiseResidualBlock(in_width, out_width, time_emb_dim)
+            return TimeConditionedBlock(in_width, out_width, time_emb_dim,
+                                        film=variant == "film", time_dilation=time_dilation)
 
-        self.down2 = TimeConditionedBlock(base_channels * 2, base_channels * 4, time_emb_dim)
+        first_stride = (2, 1) if variant == "frequency-first" else 2
+        # ENCODER (Downsampling, extracting global context)
+        self.down1 = block(base_channels, base_channels * 2)
+        self.pool1 = nn.MaxPool2d(first_stride)
+
+        self.down2 = block(base_channels * 2, base_channels * 4)
         self.pool2 = nn.MaxPool2d(2)
 
         # BOTTLENECK (Deepest representation)
-        self.bottleneck = TimeConditionedBlock(base_channels * 4, base_channels * 4, time_emb_dim)
+        self.bottleneck = block(base_channels * 4, base_channels * 4,
+                                time_dilation=4 if variant == "dilated" else 1)
 
         # DECODER (Upsampling + Skip Connections)
         self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
         # Channels: 4*base (from upsample) + 4*base (from skip connection) = 8*base
-        self.up_block1 = TimeConditionedBlock(base_channels * 8, base_channels * 2, time_emb_dim)
+        self.up_block1 = block(base_channels * 8, base_channels * 2)
 
-        self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        self.up2 = nn.Upsample(scale_factor=first_stride, mode="bilinear", align_corners=False)
         # Channels: 2*base (from upsample) + 2*base (from skip connection) = 4*base
-        self.up_block2 = TimeConditionedBlock(base_channels * 4, base_channels, time_emb_dim)
+        self.up_block2 = block(base_channels * 4, base_channels)
 
         # Final convolution outputting the velocity field
-        self.final_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
+        self.heads = None
+        if variant == "separate-heads":
+            self.heads = nn.ModuleList(nn.Sequential(nn.Conv2d(base_channels, base_channels // 2, 3, padding=1),
+                                                      nn.SiLU(), nn.Conv2d(base_channels // 2, 1, 1))
+                                       for _ in range(out_channels))
+        else:
+            self.final_conv = nn.Conv2d(base_channels, out_channels, kernel_size=1)
 
         # Initial convolution, from the manifold's state channels. This is the one
         # module whose shape depends on the manifold, so constructing it last means
@@ -171,6 +210,10 @@ class CylindricalUNet(nn.Module):
         # convolution. Moving it earlier silently reintroduces an initialisation
         # confound. Pinned by tests/test_manifolds/test_manifolds.py.
         self.init_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+        self.coarse_projections = None
+        if variant == "multiscale":
+            self.coarse_projections = nn.ModuleList(nn.Conv2d(in_channels // 2, base_channels * scale, 1)
+                                                    for scale in (2, 4, 8, 4))
 
     def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
         """Predict velocity field for state at given diffusion time.
@@ -183,6 +226,13 @@ class CylindricalUNet(nn.Module):
             Predicted velocity field [B, out_channels, H, W].
         """
         t_emb = self.time_mlp(time)
+        condition = x[:, x.shape[1] // 2:]
+
+        def condition_at(features, level):
+            if self.coarse_projections is None:
+                return features
+            coarse = F.adaptive_avg_pool2d(condition, features.shape[-2:])
+            return features + self.coarse_projections[level](coarse)
 
         x = self.init_conv(x)
 
@@ -190,22 +240,22 @@ class CylindricalUNet(nn.Module):
         d1 = self.down1(x, t_emb)
         p1 = self.pool1(d1)
 
-        d2 = self.down2(p1, t_emb)
+        d2 = self.down2(condition_at(p1, 0), t_emb)
         p2 = self.pool2(d2)
 
         # Bottleneck
-        b = self.bottleneck(p2, t_emb)
+        b = self.bottleneck(condition_at(p2, 1), t_emb)
 
         # Decoder with Skip Connections
         u1 = self.up1(b)
         u1 = torch.cat([u1, d2], dim=1)
-        u1 = self.up_block1(u1, t_emb)
+        u1 = self.up_block1(condition_at(u1, 2), t_emb)
 
         u2 = self.up2(u1)
         u2 = torch.cat([u2, d1], dim=1)
-        u2 = self.up_block2(u2, t_emb)
+        u2 = self.up_block2(condition_at(u2, 3), t_emb)
 
-        velocity = self.final_conv(u2)
+        velocity = self.final_conv(u2) if self.heads is None else torch.cat([head(u2) for head in self.heads], dim=1)
         bound = self._bound
         if bound is None:
             return velocity

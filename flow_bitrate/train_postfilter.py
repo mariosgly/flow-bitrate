@@ -22,7 +22,9 @@ from pytorch_lightning.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
 from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, SCRATCH, file_hash
-from .data import load_config, matched_seed, read_manifest
+from .data import jamendo_track_order, load_config, matched_seed, read_manifest
+from .jamendo_ablation import ARMS, CALIBRATION_FILE, FIRST_CROPS, real_crops
+from .jamendo_cache import CachedJamendoCrops, write_json
 from .postfilter import Postfilter
 
 
@@ -158,8 +160,7 @@ class TrackSampler(Sampler):
         epoch = self.epoch
         size = len(self.dataset)
         if self.dataset.training:
-            generator = torch.Generator().manual_seed(matched_seed("order", self.dataset.seed, epoch))
-            indices = torch.randperm(size, generator=generator).tolist()
+            indices = jamendo_track_order(size, self.dataset.seed, epoch).tolist()
         else:
             indices = list(range(size))
         indices.extend([-1] * (len(self) * self.world_size - size))
@@ -294,7 +295,7 @@ def main():
     launched_at = float(os.environ.get("FLOW_ALLOCATION_STARTED_AT", time.time()))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=ROOT / "configs/postfilter.json")
-    parser.add_argument("--geometry", choices=("cartesian", "disk", "cylindrical", "warped-disk"), required=True,
+    parser.add_argument("--geometry", choices=("cartesian", "disk", "cylindrical", "warped-disk"),
                         help="disk is the Euclidean Cartesian control; warped-disk changes the training bridge")
     parser.add_argument("--phase-loss", choices=("unit", "disk", "state-weighted"), default="unit")
     parser.add_argument("--phase-calibration", type=Path, help="Training-split calibration.json for state-weighted loss")
@@ -310,12 +311,51 @@ def main():
                         help="--ema enables EMA evaluation; --no-ema uses ordinary weights")
     parser.add_argument("--name")
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--ablation", type=int, choices=ARMS, metavar="ARM")
+    parser.add_argument("--campaign", help="Stable ablation directory suffix for automatic resume")
+    parser.add_argument("--target-crops", type=int, help="Total scheduled crop slots for an ablation arm")
+    parser.add_argument("--train-cache", type=Path, help="Ready six-codebook Jamendo crop cache")
+    parser.add_argument("--noise-calibration", type=Path, help="Jamendo start-noise calibration JSON")
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--nodes", type=int, default=1)
     parser.add_argument("--smoke", action="store_true", help="short two-GPU check of training and validation")
     args = parser.parse_args()
     config = load_config(args.config)
     jamendo = config.get("dataset") == "jamendo"
+    recipe = ARMS.get(args.ablation)
+    target_updates = None
+    if recipe:
+        if not jamendo or args.devices * args.nodes != 2 or args.smoke:
+            parser.error("Ablations use the Jamendo config and two GPUs")
+        if (any(value is not None for value in (args.geometry, args.backbone, args.flowdec_match, args.ema,
+                                                args.batch_size, args.accumulate))
+                or args.phase_loss != "unit"):
+            parser.error("The ablation arm supplies geometry, phase loss, optimizer, EMA and batching")
+        if args.campaign and (args.resume or args.name or Path(args.campaign).name != args.campaign
+                              or args.campaign in {".", ".."}):
+            parser.error("--campaign needs a directory suffix and manages the name and checkpoint automatically")
+        crops = FIRST_CROPS if args.target_crops is None else args.target_crops
+        if crops <= 0 or crops % 32_000:
+            parser.error("The ablation target must be a positive multiple of the 32,000-crop validation interval")
+        target_updates = crops // recipe.batch
+        args.geometry, args.phase_loss = recipe.geometry, recipe.phase_loss
+        args.name = args.name or f"jamendo-a{args.ablation:02d}-{recipe.name}-k6-seed{args.seed}"
+        memory_heavy = {"frequency-first", "convnext", "ncsnpp", "band-attention"}
+        batch_size = 2 if recipe.architecture in memory_heavy else 4
+        config.update(ablation_arm=args.ablation, width=recipe.width, architecture=recipe.architecture,
+                      start_noise=recipe.noise, schedule=recipe.schedule, ema=True,
+                      ema_decay=0.999 ** (recipe.batch / 64), batch_size=batch_size,
+                      accumulate=recipe.batch // (2 * batch_size), effective_batch=recipe.batch,
+                      validate_every=32_000 // recipe.batch)
+        if recipe.noise.startswith("jamendo-"):
+            calibration = args.noise_calibration or (args.train_cache / CALIBRATION_FILE if args.train_cache else None)
+            if calibration is None:
+                parser.error("This arm needs --noise-calibration or a calibrated --train-cache")
+            config["noise_calibration"] = json.loads(calibration.read_text())
+    elif args.geometry is None:
+        parser.error("Specify --geometry or --ablation")
+    elif any(value is not None for value in (args.campaign, args.target_crops, args.noise_calibration)):
+        parser.error("--campaign, --target-crops and --noise-calibration require --ablation")
     if args.geometry == "disk":
         args.geometry = "cartesian"
     if args.phase_loss != "unit" and (not jamendo or args.geometry != "cylindrical"):
@@ -372,6 +412,11 @@ def main():
             parser.error("Start smoke runs from fresh weights")
     if jamendo and args.smoke:
         config.update(jamendo_smoke_steps=3, validate_every=3, validation_per_domain=2)
+    max_steps = target_updates if target_updates is not None else config.get(
+        "jamendo_smoke_steps", config.get("max_updates", -1)
+    )
+    if args.train_cache and (not jamendo or max_steps < 1):
+        parser.error("--train-cache requires a Jamendo run with a finite update budget")
     if legacy_smoke:
         if os.environ.get("WANDB_MODE", "online") not in {"online", "run"}:
             raise ValueError("This smoke test checks online W&B; unset WANDB_MODE=offline/disabled")
@@ -432,6 +477,10 @@ def main():
                   "geometry": args.geometry, "seed": args.seed,
                   "world_size": args.devices * args.nodes, "settings": config}
     model = Postfilter(config, args.geometry, args.seed, provenance)
+    effective_batch = config["batch_size"] * args.devices * args.nodes * config["accumulate"]
+    if args.train_cache:
+        train = CachedJamendoCrops(train, args.train_cache, provenance["manifest_sha256"],
+                                   model.codec.identity, effective_batch, max_steps)
     averaging = "ema" if config.get("ema", False) else "noema"
     prefix = ("smoke-" if args.smoke else "") + (f"jamendo-{config['backbone']}-" if jamendo else "")
     arm = args.geometry if args.phase_loss == "unit" else f"{args.geometry}-{args.phase_loss}"
@@ -443,10 +492,14 @@ def main():
         raise ValueError("--name must be a folder name")
     resume = args.resume
     # Slurm ranks share the job ID; local DDP children inherit this generated token.
-    token = os.environ.setdefault("FLOW_POSTFILTER_RUN_ID", os.environ.get("SLURM_JOB_ID") or uuid4().hex[:12])
+    token = args.campaign or os.environ.setdefault(
+        "FLOW_POSTFILTER_RUN_ID", os.environ.get("SLURM_JOB_ID") or uuid4().hex[:12]
+    )
     run_dir = resume.resolve().parent if resume else Path(config["output"]) / f"{label}-{token}"
     run_dir.mkdir(parents=True, exist_ok=True)
     requeued = int(os.environ.get("SLURM_RESTART_COUNT", "0")) > 0
+    if args.campaign and (run_dir / "last.ckpt").is_file():
+        resume = run_dir / "last.ckpt"
     if resume is None and requeued:
         hpc = list(run_dir.glob("hpc_ckpt_*.ckpt"))
         if hpc:
@@ -459,15 +512,23 @@ def main():
         raise FileExistsError("This run directory already has a checkpoint; use --resume or a fresh submission")
     if resume is not None and not resume.is_file():
         raise FileNotFoundError(resume)
+    if recipe and resume:
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=False, mmap=True)
+        model.on_load_checkpoint(checkpoint)
+        saved_step = checkpoint["global_step"]
+        del checkpoint
+        if saved_step >= max_steps:
+            print(f"{run_dir} already reached update {saved_step:,} (target {max_steps:,})", flush=True)
+            return
     run_id = hashlib.sha256(str(run_dir).encode()).hexdigest()[:12]
     logger = WandbLogger(project=config["wandb_project"], name=run_dir.name, id=run_id,
-                         resume="allow" if resume else "never",
-                         group=f"{'smoke-' if args.smoke else ''}{arm}-{averaging}",
+                         resume="allow" if resume or args.campaign else "never",
+                         group=args.campaign or f"{'smoke-' if args.smoke else ''}{arm}-{averaging}",
                          save_dir=config["wandb_dir"], log_model=False)
     logger.log_hyperparams({"experiment": config, "geometry": args.geometry, "seed": args.seed,
                            "codec": model.codec.identity,
                            "trainable_parameters": model.trainable_parameters, "optimizer_recipe": model.optimizer_recipe,
-                           "global_batch_size": config["batch_size"] * args.devices * args.nodes * config["accumulate"]})
+                           "global_batch_size": effective_batch})
     callbacks = [RollingCheckpoint(run_dir / "last.ckpt")] if jamendo else [
         ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val/spectral", mode="min",
                         save_top_k=1, enable_version_counter=False),
@@ -501,7 +562,7 @@ def main():
                             **loader_options),
             DataLoader(valid, batch_size=1, sampler=TrackSampler(valid, rank, world_size), **loader_options),
         ]
-        if "max_updates" not in config and len(loaders[0]) // accumulate * config["max_epochs"] < config["validate_every"]:
+        if max_steps < 1 and len(loaders[0]) // accumulate * config["max_epochs"] < config["validate_every"]:
             raise ValueError("The epoch budget must reach at least one scheduled validation")
     else:
         loaders = [DataLoader(dataset, batch_size=config["batch_size"], shuffle=index == 0, drop_last=index == 0,
@@ -510,8 +571,9 @@ def main():
     trainer = pl.Trainer(
         accelerator="gpu", devices=args.devices, num_nodes=args.nodes,
         strategy=DDPStrategy(find_unused_parameters=False) if args.devices * args.nodes > 1 else "auto",
-        precision=config["precision"], max_steps=config.get("jamendo_smoke_steps", config.get("max_updates", -1)),
-        max_epochs=config["max_epochs"] if (jamendo or args.smoke) and "max_updates" not in config else -1,
+        precision=config["precision"], max_steps=max_steps,
+        max_epochs=config["max_epochs"] if (jamendo or args.smoke) and target_updates is None
+        and "max_updates" not in config else -1,
         accumulate_grad_batches=config["accumulate"], gradient_clip_val=None if jamendo else 1.0,
         val_check_interval=1.0 if legacy_smoke else config["validate_every"] * config["accumulate"],
         check_val_every_n_epoch=1 if legacy_smoke else None,
@@ -523,6 +585,8 @@ def main():
     if trainer.is_global_zero:
         (run_dir / "run.json").write_text(json.dumps({"name": run_dir.name, "wandb_id": run_id,
                 "config": config, "geometry": args.geometry, "resume": str(resume) if resume else None,
+                "training_cache": str(args.train_cache) if args.train_cache else None,
+                "target_updates": max_steps if max_steps > 0 else None,
                 "training_deadline_unix": deadline}, indent=2))
         if legacy_smoke:
             with (run_dir / "smoke_manifest.csv").open("w", newline="") as handle:
@@ -531,10 +595,22 @@ def main():
                 writer.writerows(rows)
         print(f"Run directory: {run_dir}", flush=True)
         if deadline is not None:
-            budget = f"up to {config['max_epochs']} full track passes" if jamendo else "no step or epoch cap"
+            if max_steps > 0:
+                budget = f"target {max_steps:,} optimizer updates"
+            else:
+                budget = f"up to {config['max_epochs']} full track passes" if jamendo else "no step or epoch cap"
             print(f"{int(deadline - time.time())} seconds remain before the wall-time margin; "
                   f"{budget}, no automatic requeue.", flush=True)
     trainer.fit(model, *loaders, ckpt_path=str(resume) if resume else None)
+    if recipe and trainer.is_global_zero:
+        progress = {
+            "global_step": trainer.global_step, "target_updates": max_steps,
+            "real_crops": real_crops(len(train), effective_batch, trainer.global_step),
+            "target_reached": trainer.global_step >= max_steps,
+            "fit_seconds": model.fit_seconds + (time.monotonic() - model.started if model.started else 0),
+        }
+        write_json(run_dir / "training-progress.json", progress)
+        print(f"{run_dir.name}: {trainer.global_step:,}/{max_steps:,} optimizer updates", flush=True)
     if not jamendo:
         trainer.save_checkpoint(run_dir / "last.ckpt")
     if args.smoke:

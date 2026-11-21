@@ -123,12 +123,12 @@ def make_plan(args, root, plan_path):
     rows = read_manifest(manifest, dataset="jamendo")
     if file_hash(manifest) != manifest_sha:
         raise ValueError("Manifest changed while reading it")
-    test_rows = [row for row in rows if row["split"] == "test"]
-    dataset = JamendoCrops(test_rows, "test", seed=0, seconds=10, per_domain=args.limit or len(test_rows))
+    split_rows = [row for row in rows if row["split"] == args.split]
+    dataset = JamendoCrops(split_rows, args.split, seed=0, seconds=10, per_domain=args.limit or len(split_rows))
     if len(dataset) < 2:
-        raise ValueError("FAD needs at least two eligible ten-second test excerpts")
+        raise ValueError("FAD needs at least two eligible ten-second excerpts")
     if len({row["source_id"] for row in dataset.rows}) != len(dataset):
-        raise ValueError("The test cohort needs unique track IDs")
+        raise ValueError("The cohort needs unique track IDs")
     for row in dataset.rows:
         check_audio(row)
 
@@ -141,8 +141,8 @@ def make_plan(args, root, plan_path):
             best = path / "best.ckpt"
             source = best if best.is_file() else path / "last.ckpt"
             if not source.is_file():
-                if args.require_update is not None:
-                    raise FileNotFoundError(f"No checkpoint at requested optimizer update {args.require_update}: {path}")
+                if args.require_update is not None or args.require_crops is not None:
+                    raise FileNotFoundError(f"No checkpoint at the requested training budget: {path}")
                 pending.append(str(source))
                 print(f"Awaiting first checkpoint in {path}", flush=True)
                 continue
@@ -154,6 +154,10 @@ def make_plan(args, root, plan_path):
             raise ValueError(f"{source} is at optimizer update {saved['global_step']}; requested {args.require_update}")
         hparams = saved["hyper_parameters"]
         settings = hparams["config"]
+        effective_batch = settings["batch_size"] * settings["accumulate"] * hparams["provenance"]["world_size"]
+        crop_slots = saved["global_step"] * effective_batch
+        if args.require_crops is not None and crop_slots != args.require_crops:
+            raise ValueError(f"{source} is at {crop_slots:,} scheduled crops; requested {args.require_crops:,}")
         if (settings.get("dataset") != "jamendo" or settings["codebooks"] != 6
                 or settings["evaluation_seconds"] != 10 or settings.get("jamendo_smoke_steps")
                 or hparams["provenance"]["manifest_sha256"] != manifest_sha):
@@ -163,11 +167,17 @@ def make_plan(args, root, plan_path):
             raise ValueError("Checkpoints must use the same frozen codec and FlowDec noise curve")
         codec_identity = identity
         backbone = settings.get("backbone", "cyfm")
+        architecture = settings.get("architecture", "unet" if backbone == "cyfm" else "ncsnpp")
+        cyfm_width = settings["width"] if backbone == "cyfm" and architecture not in {
+            "band-tcn", "band-attention", "ncsnpp"
+        } else None
         models[sha] = dict(source=str(source), snapshot=frozen.name, sha256=sha,
                            method=f"{source.parent.name}/{source.stem}", step=saved["global_step"],
-                           backbone=backbone, geometry=hparams["geometry"],
-                           cyfm_width=settings["width"] if backbone == "cyfm" else None,
-                           cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if backbone == "cyfm" else None,
+                           backbone=backbone, architecture=architecture, geometry=hparams["geometry"],
+                           ablation_arm=settings.get("ablation_arm"), start_noise=settings.get("start_noise", "original"),
+                           schedule=settings.get("schedule"), effective_batch=effective_batch, crop_slots=crop_slots,
+                           cyfm_width=cyfm_width,
+                           cyfm_time_width=settings.get("time_embedding_dim", 4 * cyfm_width) if cyfm_width else None,
                            optimizer_recipe=settings.get("optimizer_recipe", backbone),
                            trainable_parameters=saved.get("trainable_parameters"), fit_seconds=saved.get("fit_seconds"),
                            training_gpus=hparams["provenance"]["world_size"],
@@ -189,9 +199,9 @@ def make_plan(args, root, plan_path):
                     clap_sha256=clap_sha)
     plan = dict(protocol=protocol, manifest_sha256=manifest_sha, codec=codec_identity,
                 codec_dir=config["checkpoints"], clap=clap.name, nfe=args.nfe, solver="midpoint",
-                seeds=seeds, tracks=dataset.rows, models=list(models.values()), pending=pending)
+                split=args.split, seeds=seeds, tracks=dataset.rows, models=list(models.values()), pending=pending)
     write_json(plan_path, plan, immutable=True)
-    print(f"Plan {plan_path}: {len(models)} checkpoint versions, {len(dataset)} test clips, {len(pending)} pending")
+    print(f"Plan {plan_path}: {len(models)} checkpoint versions, {len(dataset)} {args.split} clips, {len(pending)} pending")
 
 
 class Records:
@@ -251,7 +261,8 @@ def score(args, root, plan, records):
         remaining = float(os.environ["SLURM_JOB_END_TIME"]) - time.time() - 90
         deadline = min(deadline, time.monotonic() + remaining)
     device = torch.device(args.device)
-    dataset = JamendoCrops(plan["tracks"], "test", seed=0, seconds=10, per_domain=len(plan["tracks"]))
+    dataset = JamendoCrops(plan["tracks"], plan.get("split", "test"), seed=0, seconds=10,
+                          per_domain=len(plan["tracks"]))
     assigned = range(args.shard, len(dataset), args.shards)
     metrics = None
     written = 0
@@ -385,7 +396,7 @@ def report(args, plan, records, directory):
             writer.writerows(rows)
     artist_reports(directory, details, METRICS)
     write_json(directory / "summary.json", dict(protocol=plan["protocol"], manifest_sha256=plan["manifest_sha256"],
-                                                results=summary, pending=plan["pending"]))
+                                                split=plan.get("split", "test"), results=summary, pending=plan["pending"]))
     print(f"Reports saved in {directory}")
 
 
@@ -398,8 +409,11 @@ def main():
     parser.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt or last.ckpt")
     parser.add_argument("--clap-weights", type=Path, default=DEFAULT_CLAP)
     parser.add_argument("--nfe", type=int, default=6, help="Inference budget, 1 for Euler or an even midpoint budget")
-    parser.add_argument("--limit", type=int, help="Use a small fixed subset when trying the pipeline")
-    parser.add_argument("--require-update", type=int, help="When planning, require this optimizer update for all checkpoints")
+    parser.add_argument("--split", choices=("val", "test"), default="test", help="Cohort to use when planning")
+    parser.add_argument("--limit", type=int, help="Use a fixed subset per domain when planning")
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument("--require-update", type=int, help="Require this optimizer update for all checkpoints")
+    budget.add_argument("--require-crops", type=int, help="Require this many scheduled crop slots for all checkpoints")
     parser.add_argument("--shards", type=int, default=1)
     parser.add_argument("--shard", type=int, default=int(os.environ.get("SLURM_ARRAY_TASK_ID", "0")))
     parser.add_argument("--device", default="cuda")
@@ -419,8 +433,8 @@ def main():
             parser.error("--limit must be at least two")
         make_plan(args, root, plan_path)
     else:
-        if args.require_update is not None:
-            parser.error("--require-update applies when creating a plan")
+        if args.require_update is not None or args.require_crops is not None:
+            parser.error("Checkpoint budget guards apply when creating a plan")
         plan = read_json(plan_path)
         if plan["protocol"]["version"] != PROTOCOL_VERSION:
             parser.error("This plan uses a different scoring protocol")

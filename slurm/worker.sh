@@ -20,6 +20,8 @@ elif [[ "$task" == postfilter-evaluate ]]; then
   exec python -m flow_bitrate.evaluate_postfilter "$@"
 elif [[ "$task" == jamendo-geometry ]]; then
   exec python -m flow_bitrate.jamendo_geometry "$@"
+elif [[ "$task" == jamendo-cache ]]; then
+  exec python -m flow_bitrate.jamendo_cache "$@"
 elif [[ "$task" == jamendo-score ]]; then
   export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
   exec python -m flow_bitrate.score_jamendo score "$@"

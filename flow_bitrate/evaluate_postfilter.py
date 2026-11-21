@@ -53,9 +53,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--checkpoints", type=Path, nargs="+")
-    inputs.add_argument("--score-plan", type=Path, help="Jamendo plan.json with frozen checkpoints and test tracks")
+    inputs.add_argument("--score-plan", type=Path, help="Jamendo plan.json with frozen checkpoints and cohort")
     parser.add_argument("--name", default="postfilter-comparison")
-    parser.add_argument("--split", choices=("val", "test"), default="test")
+    parser.add_argument("--split", choices=("val", "test"))
     parser.add_argument("--per-domain", type=int)
     parser.add_argument("--nfe", type=int, nargs="+", help="Evaluate these network-call budgets")
     parser.add_argument("--require-update", type=int, help="Require every checkpoint to contain this optimizer update")
@@ -82,6 +82,8 @@ def main():
     else:
         checkpoints = args.checkpoints
         labels = [path.parent.name for path in checkpoints]
+    plan_split = score_plan.get("split", "test") if score_plan is not None else "test"
+    args.split = args.split or plan_split
     first = torch.load(checkpoints[0], map_location="cpu", weights_only=False)
     config = first["hyper_parameters"]["config"]
     provenance = first["hyper_parameters"]["provenance"]
@@ -93,8 +95,8 @@ def main():
     noise_seeds = config["evaluation_seeds"]
     default_budgets = config["evaluation_nfe"]
     if score_plan is not None:
-        if not jamendo or args.split != "test" or score_plan["manifest_sha256"] != expected_manifest:
-            parser.error("--score-plan requires Jamendo test checkpoints on the plan's manifest")
+        if not jamendo or args.split != plan_split or score_plan["manifest_sha256"] != expected_manifest:
+            parser.error("--score-plan requires Jamendo checkpoints on the plan's manifest and split")
         solver = score_plan["solver"]
         noise_seeds = score_plan["seeds"]
         default_budgets = [score_plan["nfe"]]
@@ -133,7 +135,8 @@ def main():
     if len(set(labels)) != len(labels):
         raise ValueError("Checkpoints must have distinct run labels")
     arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier",
-                     "width", "time_embedding_dim", "optimizer_recipe", "max_updates"}
+                     "width", "time_embedding_dim", "optimizer_recipe", "max_updates", "ablation_arm", "architecture",
+                     "schedule", "start_noise", "noise_calibration", "ema_decay", "effective_batch", "validate_every"}
                     if jamendo else {"ema", "ema_decay"})
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     if jamendo:
@@ -166,11 +169,15 @@ def main():
                        "trainable_parameters": model.trainable_parameters, "fit_seconds": model.fit_seconds})
         if jamendo:
             effective_batch = settings["batch_size"] * settings["accumulate"] * provenance["world_size"]
-            if effective_batch != expected_batch:
+            if effective_batch != expected_batch and not (
+                    config.get("ablation_arm") and settings.get("ablation_arm")):
                 raise ValueError("Jamendo checkpoints must have the same effective training batch size")
-            cyfm = model.backbone_name == "cyfm"
+            architecture = settings.get("architecture", "unet" if model.backbone_name == "cyfm" else "ncsnpp")
+            cyfm = model.backbone_name == "cyfm" and architecture not in {"band-tcn", "band-attention", "ncsnpp"}
             models[-1].update(batch_size_per_gpu=settings["batch_size"], accumulate=settings["accumulate"],
                               effective_batch_size=effective_batch, optimizer_recipe=model.optimizer_recipe,
+                              architecture=architecture, start_noise=settings.get("start_noise", "original"),
+                              schedule=settings.get("schedule"), crop_slots=model.checkpoint_step * effective_batch,
                               cyfm_width=settings["width"] if cyfm else None,
                               cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if cyfm else None)
         released = FlowCodec(config["checkpoints"]).eval().cuda() if args.released and model_index == 0 else None
