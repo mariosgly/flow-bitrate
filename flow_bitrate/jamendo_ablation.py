@@ -1,4 +1,4 @@
-"""Fixed recipes for the first six-codebook Jamendo ablation round."""
+"""Fixed recipes for the six-codebook Jamendo ablations."""
 
 import math
 from dataclasses import dataclass, replace
@@ -48,6 +48,11 @@ ARMS = dict(enumerate((
             phase_loss="unit", architecture="band-tcn"),
     Arm("small-disk-batch128", width=64, batch=128),
     replace(REFERENCE, name="medium-disk-separate-heads", architecture="separate-heads"),
+    Arm("small-disk-sigma-three-quarters-epoch-cosine", width=64, noise="scale:0.75",
+        schedule="epoch-cosine"),
+    replace(REFERENCE, name="medium-disk-multiscale-sigma-jamendo-raw", architecture="multiscale",
+            noise="jamendo-raw"),
+    Arm("small-disk-multiscale", width=64, architecture="multiscale"),
 ), start=1))
 
 

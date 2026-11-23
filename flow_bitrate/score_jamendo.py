@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import csv
 import fcntl
 import hashlib
+from itertools import groupby
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import time
 import numpy as np
 import torch
 from torchaudio.transforms import Spectrogram
+from tqdm import tqdm
 
 from .codec import ROOT, SAMPLE_RATE, SCRATCH, FlowCodec, file_hash
 from .data import load_config, matched_seed, read_manifest
@@ -200,8 +202,24 @@ def make_plan(args, root, plan_path):
     plan = dict(protocol=protocol, manifest_sha256=manifest_sha, codec=codec_identity,
                 codec_dir=config["checkpoints"], clap=clap.name, nfe=args.nfe, solver="midpoint",
                 split=args.split, seeds=seeds, tracks=dataset.rows, models=list(models.values()), pending=pending)
+    if args.blend_weights is not None:
+        plan["blend_weights"] = args.blend_weights
     write_json(plan_path, plan, immutable=True)
     print(f"Plan {plan_path}: {len(models)} checkpoint versions, {len(dataset)} {args.split} clips, {len(pending)} pending")
+
+
+def derive_plan(args, root, plan_path):
+    source_path = root / "plans" / args.from_plan / "plan.json"
+    plan = read_json(source_path)
+    if plan["protocol"]["version"] != PROTOCOL_VERSION:
+        raise ValueError("Source plan uses a different scoring protocol")
+    models = [model for model in plan["models"] if model.get("ablation_arm") in args.arms]
+    if sorted(model["ablation_arm"] for model in models) != sorted(args.arms):
+        raise ValueError("The source plan must contain exactly one checkpoint for each requested arm")
+    plan.update(models=models, pending=[], blend_weights=args.blend_weights, source_plan=args.from_plan)
+    write_json(plan_path, plan, immutable=True)
+    print(f"Plan {plan_path}: reusing {len(models)} checkpoints and {len(plan['tracks'])} clips "
+          f"from {args.from_plan} at NFE {plan['nfe']}")
 
 
 class Records:
@@ -211,12 +229,14 @@ class Records:
         self.nfe = plan["nfe"]
         self.solver = plan["solver"]
 
-    def path(self, row, model=None, seed=None):
+    def path(self, row, model=None, seed=None, weight=1.0):
         track = digest(row)
         if model is None:
             name = self.ndac_key if seed is None else "clean"
         else:
             name = f"{model['sha256']}-{self.solver}-nfe{self.nfe}-seed{seed}"
+            if weight != 1.0:
+                name += f"-blend{weight}"
         return self.root / track[:2] / track / f"{name}.json"
 
 
@@ -266,76 +286,98 @@ def score(args, root, plan, records):
     assigned = range(args.shard, len(dataset), args.shards)
     metrics = None
     written = 0
-    for method in [None, *plan["models"]]:
-        model = None
-        for index in assigned:
-            if time.monotonic() >= deadline:
-                print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
-                return
-            row = dataset.rows[index]
-            seeds = plan["seeds"] if method else ["clean", None]
-            paths = {seed: records.path(row, method, seed) for seed in seeds}
-            if all(path.is_file() for path in paths.values()):
-                continue
-            lock_path = records.path(row, method, "lock" if method else "clean")
-            with record_lock(lock_path) as acquired:
-                if not acquired:
-                    continue
-                missing = [seed for seed, path in paths.items() if not path.is_file()]
+    weights = plan.get("blend_weights", [1.0])
+    total = len(assigned) * (2 + len(plan["models"]) * len(plan["seeds"]) * len(weights))
+    with tqdm(total=total, desc=f"Shard {args.shard}/{args.shards} NFE {plan['nfe']}",
+              unit="record", mininterval=15) as progress:
+        for method in [None, *plan["models"]]:
+            model = None
+            for index in assigned:
+                if time.monotonic() >= deadline:
+                    print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
+                    return
+                row = dataset.rows[index]
+                requests = [(seed, weight) for seed in plan["seeds"] for weight in weights] if method else [
+                    ("clean", 1.0), (None, 1.0)
+                ]
+                paths = {request: records.path(row, method, *request) for request in requests}
+                missing = [request for request, path in paths.items() if not path.is_file()]
+                progress.update(len(paths) - len(missing))
                 if not missing:
                     continue
-                check_audio(row)
-                audio, track = dataset[index]
-                original = audio[None]
-                if metrics is None:
-                    metrics = Metrics(root / "snapshots" / plan["clap"], device)
-                if "clean" in missing:
-                    write_json(paths["clean"], {"embedding": metrics.embed(original)})
-                    missing.remove("clean")
-                    written += 1
-                if not missing:
-                    continue
-                if model is None:
+                lock_path = records.path(row, method, "lock" if method else "clean")
+                with record_lock(lock_path) as acquired:
+                    if not acquired:
+                        continue
+                    still_missing = [request for request in missing if not paths[request].is_file()]
+                    progress.update(len(missing) - len(still_missing))
+                    missing = still_missing
+                    if not missing:
+                        continue
+                    check_audio(row)
+                    audio, track = dataset[index]
+                    original = audio[None]
+                    if metrics is None:
+                        metrics = Metrics(root / "snapshots" / plan["clap"], device)
+                    clean = ("clean", 1.0)
+                    if clean in missing:
+                        write_json(paths[clean], {"embedding": metrics.embed(original)})
+                        missing.remove(clean)
+                        written += 1
+                        progress.update(1)
+                    if not missing:
+                        continue
+                    if model is None:
+                        if method:
+                            model = Postfilter.load_from_checkpoint(
+                                root / "snapshots" / method["snapshot"], map_location="cpu"
+                            ).eval().to(device)
+                            codec = model.codec
+                        else:
+                            codec = FlowCodec(plan["codec_dir"], load_backbone=False, configured_noise=True).to(device)
+                            model = codec
+                        if codec.identity != plan["codec"]:
+                            raise ValueError("The current NDAC or FlowDec noise assets differ from the plan")
                     if method:
-                        model = Postfilter.load_from_checkpoint(
-                            root / "snapshots" / method["snapshot"], map_location="cpu"
-                        ).eval().to(device)
-                        codec = model.codec
+                        coarse = model.coarse_audio(original.to(device))
                     else:
-                        codec = FlowCodec(plan["codec_dir"], load_backbone=False, configured_noise=True).to(device)
-                        model = codec
-                    if codec.identity != plan["codec"]:
-                        raise ValueError("The current NDAC or FlowDec noise assets differ from the plan")
-                if method:
-                    coarse = model.coarse_audio(original.to(device))
-                else:
-                    samples = original.shape[-1]
-                    _, codes = model.encode(original.to(device), samples)
-                    coarse, _ = model.coarse(codes, plan["protocol"]["codebooks"], samples)
-                for seed in missing:
-                    if time.monotonic() >= deadline:
-                        print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
-                        return
-                    output = model.enhance(coarse, plan["nfe"], matched_seed("evaluation", track, seed),
-                                           plan["solver"]) if method else coarse
-                    write_json(paths[seed], metrics.paired(original, output))
-                    written += 1
-                    if written % 25 == 0:
-                        print(f"Shard {args.shard}: saved {written} new records", flush=True)
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+                        samples = original.shape[-1]
+                        _, codes = model.encode(original.to(device), samples)
+                        coarse, _ = model.coarse(codes, plan["protocol"]["codebooks"], samples)
+                    for seed, variants in groupby(missing, key=lambda request: request[0]):
+                        if time.monotonic() >= deadline:
+                            print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
+                            return
+                        output = model.enhance(coarse, plan["nfe"], matched_seed("evaluation", track, seed),
+                                               plan["solver"]) if method else coarse
+                        for request in variants:
+                            if time.monotonic() >= deadline:
+                                print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.",
+                                      flush=True)
+                                return
+                            weight = request[1]
+                            waveform = output if weight == 1.0 else torch.lerp(coarse, output, weight)
+                            write_json(paths[request], metrics.paired(original, waveform))
+                            written += 1
+                            progress.update(1)
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     print(f"Shard {args.shard}/{args.shards}: saved {written} new records", flush=True)
 
 
 def report(args, plan, records, directory):
     tracks, seeds = plan["tracks"], plan["seeds"]
-    methods = [None, *plan["models"]]
+    blending = "blend_weights" in plan
+    weights = plan.get("blend_weights", [1.0])
+    methods = [(None, 0.0), *((model, weight) for model in plan["models"] for weight in weights)]
     incomplete = False
     groups = [("Clean references", [(row, records.path(row, seed="clean")) for row in tracks])]
-    for model in methods:
+    for model, weight in methods:
         label = f"{model['method']}@{model['sha256'][:12]}" if model else "NDAC-75"
-        groups.append((label, [(row, records.path(row, model, seed)) for row in tracks
+        if blending and model:
+            label += f" blend={weight}"
+        groups.append((label, [(row, records.path(row, model, seed, weight)) for row in tracks
                               for seed in (seeds if model else [None])]))
     for label, jobs in groups:
         missing = [row["source_id"] for row, path in jobs if not path.is_file()]
@@ -365,7 +407,7 @@ def report(args, plan, records, directory):
         return float(max(0, difference @ difference + np.trace(covariance + covariance_recon) - 2 * cross_trace))
 
     summary, details = [], []
-    for model, (label, jobs) in zip(methods, groups[1:]):
+    for (model, weight), (label, jobs) in zip(methods, groups[1:]):
         method_seeds = seeds if model else [None]
         by_seed = {seed: [] for seed in method_seeds}
         paired = {metric: [] for metric in METRICS}
@@ -376,8 +418,11 @@ def report(args, plan, records, directory):
                 result = read_json(jobs[track_index * len(method_seeds) + seed_index][1])
                 by_seed[seed].append(result["embedding"])
                 results.append(result)
-                details.append(dict(method=label, nfe=nfe, seed=seed, track=row["source_id"],
-                                    artist=row["group"], **{metric: result[metric] for metric in METRICS}))
+                detail = dict(method=label, nfe=nfe, seed=seed, track=row["source_id"],
+                              artist=row["group"], **{metric: result[metric] for metric in METRICS})
+                if blending:
+                    detail["blend_weight"] = weight
+                details.append(detail)
             for metric in METRICS:
                 values = [result[metric] for result in results if result[metric] is not None]
                 if values:
@@ -385,6 +430,8 @@ def report(args, plan, records, directory):
         fad_by_seed = {str(seed): fad(np.asarray(vectors, dtype=np.float64)) for seed, vectors in by_seed.items()}
         row = dict(method=label, bitrate_kbps=4.5, nfe=nfe, tracks=len(tracks),
                    fad_x100=100 * float(np.mean(list(fad_by_seed.values()))))
+        if blending:
+            row["blend_weight"] = weight
         row.update({metric: float(np.mean(values)) if values else None for metric, values in paired.items()})
         row.update({f"{metric}_tracks": len(values) for metric, values in paired.items()})
         summary.append({**row, "fad_by_seed": fad_by_seed, "checkpoint": model})
@@ -406,10 +453,14 @@ def main():
     parser.add_argument("--name", required=True, help="Name of an immutable evaluation plan")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="Shared cache and report directory")
     parser.add_argument("--config", type=Path, default=ROOT / "configs/jamendo.json")
-    parser.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt or last.ckpt")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt or last.ckpt")
+    source.add_argument("--from-plan", help="Reuse the frozen checkpoint versions, cohort, seeds and NFE of this plan")
+    parser.add_argument("--arms", type=int, nargs="+", help="Select ablation arms from --from-plan")
+    parser.add_argument("--blend-weights", type=float, nargs="+", help="Score NDAC + weight * (enhanced - NDAC)")
     parser.add_argument("--clap-weights", type=Path, default=DEFAULT_CLAP)
-    parser.add_argument("--nfe", type=int, default=6, help="Inference budget, 1 for Euler or an even midpoint budget")
-    parser.add_argument("--split", choices=("val", "test"), default="test", help="Cohort to use when planning")
+    parser.add_argument("--nfe", type=int, help="Inference budget, 1 for Euler or an even midpoint budget (default 6)")
+    parser.add_argument("--split", choices=("val", "test"), help="Cohort to use when planning (default test)")
     parser.add_argument("--limit", type=int, help="Use a fixed subset per domain when planning")
     budget = parser.add_mutually_exclusive_group()
     budget.add_argument("--require-update", type=int, help="Require this optimizer update for all checkpoints")
@@ -427,14 +478,32 @@ def main():
     if args.action == "plan":
         if plan_path.exists():
             parser.error(f"Plan already exists. Reuse it for scoring or use a new name: {plan_path}")
+        if args.blend_weights is not None and (
+                len(set(args.blend_weights)) != len(args.blend_weights)
+                or any(not 0 < weight <= 1 for weight in args.blend_weights)):
+            parser.error("Use distinct --blend-weights in (0, 1]; NDAC is already included at weight 0")
+        if args.from_plan is not None:
+            if Path(args.from_plan).name != args.from_plan or args.from_plan in {"", ".", ".."}:
+                parser.error("--from-plan must be a folder name")
+            if not args.arms or len(set(args.arms)) != len(args.arms) or args.blend_weights is None:
+                parser.error("Use distinct --arms and set --blend-weights with --from-plan")
+            if any(value is not None for value in (args.nfe, args.split, args.limit, args.require_update, args.require_crops)):
+                parser.error("--from-plan inherits the checkpoint budgets, cohort and NFE of the source plan")
+            derive_plan(args, root, plan_path)
+            return
+        if args.arms is not None:
+            parser.error("--arms requires --from-plan")
+        args.nfe = 6 if args.nfe is None else args.nfe
+        args.split = args.split or "test"
         if not args.checkpoints or args.nfe < 1 or (args.nfe != 1 and args.nfe % 2):
             parser.error("Pass checkpoints and either NFE 1 or a positive even NFE")
         if args.limit is not None and args.limit < 2:
             parser.error("--limit must be at least two")
         make_plan(args, root, plan_path)
     else:
-        if args.require_update is not None or args.require_crops is not None:
-            parser.error("Checkpoint budget guards apply when creating a plan")
+        if any(value is not None for value in (args.require_update, args.require_crops, args.from_plan,
+                                                args.arms, args.blend_weights)):
+            parser.error("Checkpoint budget guards and blend settings apply when creating a plan")
         plan = read_json(plan_path)
         if plan["protocol"]["version"] != PROTOCOL_VERSION:
             parser.error("This plan uses a different scoring protocol")
