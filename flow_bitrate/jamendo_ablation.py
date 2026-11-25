@@ -53,6 +53,8 @@ ARMS = dict(enumerate((
     replace(REFERENCE, name="medium-disk-multiscale-sigma-jamendo-raw", architecture="multiscale",
             noise="jamendo-raw"),
     Arm("small-disk-multiscale", width=64, architecture="multiscale"),
+    replace(REFERENCE, name="medium-disk-band-attention-sigma-jamendo-raw", architecture="band-attention",
+            noise="jamendo-raw"),
 ), start=1))
 
 
