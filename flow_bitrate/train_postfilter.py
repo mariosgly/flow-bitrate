@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, get_worker_info
 
 from .codec import BLOCK_SAMPLES, ROOT, SAMPLE_RATE, SCRATCH, file_hash
 from .data import jamendo_track_order, load_config, matched_seed, read_manifest
-from .jamendo_ablation import ARMS, CALIBRATION_FILE, FIRST_CROPS, real_crops
+from .jamendo_ablation import ARMS, CALIBRATION_FILE, FIRST_CROPS, LONG_FIRST_CROPS, real_crops
 from .jamendo_cache import CachedJamendoCrops, write_json
 from .postfilter import Postfilter
 
@@ -314,6 +314,7 @@ def main():
     parser.add_argument("--ablation", type=int, choices=ARMS, metavar="ARM")
     parser.add_argument("--campaign", help="Stable ablation directory suffix for automatic resume")
     parser.add_argument("--target-crops", type=int, help="Total scheduled crop slots for an ablation arm")
+    parser.add_argument("--allocation-hours", type=float, help="Time limit for this submission before the checkpoint margin")
     parser.add_argument("--train-cache", type=Path, help="Ready six-codebook Jamendo crop cache")
     parser.add_argument("--noise-calibration", type=Path, help="Jamendo start-noise calibration JSON")
     parser.add_argument("--devices", type=int, default=1)
@@ -321,12 +322,16 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="short two-GPU check of training and validation")
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.allocation_hours is not None and (not math.isfinite(args.allocation_hours) or args.allocation_hours <= 0):
+        parser.error("--allocation-hours must be positive and finite")
     jamendo = config.get("dataset") == "jamendo"
     recipe = ARMS.get(args.ablation)
     target_updates = None
     if recipe:
-        if not jamendo or args.devices * args.nodes != 2 or args.smoke:
-            parser.error("Ablations use the Jamendo config and two GPUs")
+        long_run = recipe.schedule == "wsd-long"
+        world_size = args.devices * args.nodes
+        if not jamendo or world_size != (4 if long_run else 2) or args.smoke:
+            parser.error("Use the Jamendo config and four GPUs for long arms, or two GPUs for the original arms")
         if (any(value is not None for value in (args.geometry, args.backbone, args.flowdec_match, args.ema,
                                                 args.batch_size, args.accumulate))
                 or args.phase_loss != "unit"):
@@ -334,7 +339,8 @@ def main():
         if args.campaign and (args.resume or args.name or Path(args.campaign).name != args.campaign
                               or args.campaign in {".", ".."}):
             parser.error("--campaign needs a directory suffix and manages the name and checkpoint automatically")
-        crops = FIRST_CROPS if args.target_crops is None else args.target_crops
+        default_crops = LONG_FIRST_CROPS if long_run else FIRST_CROPS
+        crops = default_crops if args.target_crops is None else args.target_crops
         if crops <= 0 or crops % 32_000:
             parser.error("The ablation target must be a positive multiple of the 32,000-crop validation interval")
         target_updates = crops // recipe.batch
@@ -345,8 +351,10 @@ def main():
         config.update(ablation_arm=args.ablation, width=recipe.width, architecture=recipe.architecture,
                       start_noise=recipe.noise, schedule=recipe.schedule, ema=True,
                       ema_decay=0.999 ** (recipe.batch / 64), batch_size=batch_size,
-                      accumulate=recipe.batch // (2 * batch_size), effective_batch=recipe.batch,
+                      accumulate=recipe.batch // (world_size * batch_size), effective_batch=recipe.batch,
                       validate_every=32_000 // recipe.batch)
+        if long_run:
+            config.update(band_width=recipe.band_width, highband_loss_weight=recipe.highband_loss_weight)
         if recipe.noise.startswith("jamendo-"):
             calibration = args.noise_calibration or (args.train_cache / CALIBRATION_FILE if args.train_cache else None)
             if calibration is None:
@@ -543,7 +551,7 @@ def main():
         callbacks.append(smoke)
     deadline = None
     if not args.smoke:
-        deadline = launched_at + config["allocation_hours"] * 3600
+        deadline = launched_at + (args.allocation_hours or config["allocation_hours"]) * 3600
         if os.environ.get("SLURM_JOB_END_TIME"):
             deadline = min(deadline, float(os.environ["SLURM_JOB_END_TIME"]))
         deadline -= config["shutdown_margin_minutes"] * 60

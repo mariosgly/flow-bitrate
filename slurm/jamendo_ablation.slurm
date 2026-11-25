@@ -12,7 +12,7 @@
 
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR}"
-campaign="${1:?Usage: sbatch --array=1-24 slurm/jamendo_ablation.slurm CAMPAIGN [training options]}"
+campaign="${1:?Usage: sbatch --array=ARMS slurm/jamendo_ablation.slurm CAMPAIGN [training options]}"
 shift
 if [[ ! "$campaign" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "Use letters, numbers, dashes, dots or underscores for the campaign name." >&2

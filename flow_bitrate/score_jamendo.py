@@ -176,6 +176,8 @@ def make_plan(args, root, plan_path):
         models[sha] = dict(source=str(source), snapshot=frozen.name, sha256=sha,
                            method=f"{source.parent.name}/{source.stem}", step=saved["global_step"],
                            backbone=backbone, architecture=architecture, geometry=hparams["geometry"],
+                           band_width=settings.get("band_width", 256) if architecture.startswith("band-") else None,
+                           highband_loss_weight=settings.get("highband_loss_weight", 0.0),
                            ablation_arm=settings.get("ablation_arm"), start_noise=settings.get("start_noise", "original"),
                            schedule=settings.get("schedule"), effective_batch=effective_batch, crop_slots=crop_slots,
                            cyfm_width=cyfm_width,

@@ -19,6 +19,10 @@ from .metrics import si_sdr, spectral_loss
 from .phase_geometry import PHASE_FLOOR, matched_draw, noise_scale, phase_weight, warped_disk_bridge
 
 
+HIGHBANDS_HZ = ((1000, 2000), (2000, 4000), (4000, 8000), (8000, 16000))
+HIGHBAND_MAGNITUDE_FLOOR = 0.03
+
+
 class Postfilter(pl.LightningModule):
     def __init__(self, config, geometry, seed=0, provenance=None):
         super().__init__()
@@ -43,6 +47,15 @@ class Postfilter(pl.LightningModule):
             raise ValueError("The disk experiments use the Jamendo noise and crop protocol")
         self.codec = FlowCodec(config["checkpoints"], load_backbone=False, configured_noise=self.jamendo)
         self.codec.requires_grad_(False)
+        self.highband_loss_weight = config.get("highband_loss_weight", 0.0)
+        self.monitor_highbands = config.get("schedule") == "wsd-long"
+        if self.highband_loss_weight and (not self.jamendo or not self.polar_state):
+            raise ValueError("The high-band endpoint loss requires a cylindrical Jamendo bridge")
+        if self.monitor_highbands or self.highband_loss_weight:
+            stft = self.codec.features.complex_stft
+            self.highband_bins = tuple(slice(math.ceil(low * stft.n_fft / SAMPLE_RATE),
+                                             math.ceil(high * stft.n_fft / SAMPLE_RATE))
+                                       for low, high in HIGHBANDS_HZ)
         self.register_buffer("start_sigma", self.ablation_sigma(config, seed, provenance), persistent=False)
         if self.phase_loss == "state-weighted":
             calibration = config["phase_calibration"]
@@ -63,7 +76,8 @@ class Postfilter(pl.LightningModule):
         elif architecture == "ncsnpp":
             self.network = reduced_ncsnpp(2 * channels)
         elif architecture in {"band-tcn", "band-attention"}:
-            self.network = BandSplitVelocity(2 * channels, attention=architecture == "band-attention")
+            self.network = BandSplitVelocity(2 * channels, attention=architecture == "band-attention",
+                                             width=config.get("band_width", 256))
         else:
             self.network = CylindricalUNet(base_channels=config["width"], in_channels=2 * channels,
                                            out_channels=2, velocity_bound=None,
@@ -156,7 +170,13 @@ class Postfilter(pl.LightningModule):
         start, times = matched_draw(condition, sigma, seeds)
         return self.coordinates(start), times
 
-    def velocity_errors(self, condition, target, frames, seed=None, example_seeds=None):
+    def highband_errors(self, estimate_magnitude, reference_magnitude):
+        """Per-crop, per-band log-magnitude error in the compressed STFT."""
+        delta = ((estimate_magnitude / HIGHBAND_MAGNITUDE_FLOOR).log1p()
+                 - (reference_magnitude / HIGHBAND_MAGNITUDE_FLOOR).log1p()).abs()
+        return torch.stack([delta[:, :, bins, :].mean((1, 2, 3)) for bins in self.highband_bins], dim=1)
+
+    def velocity_errors(self, condition, target, frames, seed=None, example_seeds=None, include_highband=False):
         if example_seeds is None:
             start, generator = self.start(condition, seed)
             time_value = torch.rand(len(start), device=start.device, generator=generator)
@@ -187,7 +207,14 @@ class Postfilter(pl.LightningModule):
                 weight = phase_weight(amplitude, tau) / self.phase_weight_mean
             weight = F.pad(weight, (0, errors.shape[-1] - frames), value=1.0)
             errors = torch.cat((errors[:, :1], errors[:, 1:] * weight), dim=1)
-        return errors.mean((2, 3))
+        errors = errors.mean((2, 3))
+        if include_highband:
+            # The cylindrical bridge is linear in magnitude. Predict its clean endpoint
+            # using the remaining time and the same magnitude velocity from flow matching.
+            endpoint = state[:, :1, :, :frames] + (1 - t) * prediction[:, :1, :, :frames]
+            highband = self.highband_errors(endpoint.clamp_min(0), target[..., :frames].abs()).mean(1)
+            return errors, highband
+        return errors
 
     def flow_loss(self, condition, target, frames, seed=None):
         errors = self.velocity_errors(condition, target, frames, seed)
@@ -239,8 +266,10 @@ class Postfilter(pl.LightningModule):
                 audio, seeds = audio
                 coarse = None
             _, condition, target, info = self.prepare(audio, coarse)
-            errors = self.velocity_errors(condition, target, info[1], example_seeds=seeds.tolist())
-            loss_sum = errors.masked_fill(seeds[:, None] < 0, 0).sum()
+            result = self.velocity_errors(condition, target, info[1], example_seeds=seeds.tolist(),
+                                          include_highband=bool(self.highband_loss_weight))
+            errors, highband = result if self.highband_loss_weight else (result, None)
+            flow_sum = errors.masked_fill(seeds[:, None] < 0, 0).sum()
             loader = self.trainer.train_dataloader
             accumulate = self.trainer.accumulate_grad_batches
             window, microbatch = divmod(batch_idx, accumulate)
@@ -248,12 +277,23 @@ class Postfilter(pl.LightningModule):
             window_size = loader.batch_size * accumulate * world_size
             count = min(window_size, len(loader.dataset) - window * window_size)
             if microbatch == 0:
-                self.update_loss_sum = loss_sum.detach().clone()
+                self.update_loss_sum = flow_sum.detach().clone()
             else:
-                self.update_loss_sum += loss_sum.detach()
+                self.update_loss_sum += flow_sum.detach()
             if microbatch == accumulate - 1:
                 self.log("train/flow_loss", self.update_loss_sum * (world_size / count),
                          on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+            loss_sum = flow_sum
+            if highband is not None:
+                highband_sum = highband.masked_fill(seeds < 0, 0).sum()
+                if microbatch == 0:
+                    self.update_highband_sum = highband_sum.detach().clone()
+                else:
+                    self.update_highband_sum += highband_sum.detach()
+                if microbatch == accumulate - 1:
+                    self.log("train/highband_endpoint", self.update_highband_sum * (world_size / count),
+                             on_step=True, on_epoch=False, sync_dist=True, batch_size=1)
+                loss_sum = flow_sum + self.highband_loss_weight * highband_sum
             # Lightning divides by accumulate and DDP averages across ranks.
             # Every real crop in an update gets equal weight, including the epoch tail.
             return loss_sum * (world_size * accumulate / count)
@@ -295,6 +335,11 @@ class Postfilter(pl.LightningModule):
             self.validation_totals = torch.zeros(
                 (1 + len(self.hparams.config["validation_nfe"]), 2), device=self.device, dtype=torch.float64
             )
+            if self.monitor_highbands:
+                self.validation_highbands = torch.zeros(
+                    (1 + len(self.hparams.config["validation_nfe"]), len(HIGHBANDS_HZ)),
+                    device=self.device, dtype=torch.float64,
+                )
 
     def jamendo_validation_step(self, batch, batch_idx):
         config = self.hparams.config
@@ -305,12 +350,25 @@ class Postfilter(pl.LightningModule):
         coarse = self.coarse_audio(audio)
         self.validation_totals[0, 0] += spectral_loss(audio, coarse).sum()
         self.validation_totals[0, 1] += 1
+        if self.monitor_highbands:
+            with torch.autocast(device_type=audio.device.type, enabled=False):
+                coarse_stft, reference, (scale, frames, _) = self.codec.preprocess(coarse, audio.float())
+                reference_magnitude = reference[..., :frames].abs()
+                self.validation_highbands[0] += self.highband_errors(
+                    coarse_stft[..., :frames].abs(), reference_magnitude
+                ).sum(0)
         for index, nfe in enumerate(config["validation_nfe"], start=1):
             for sample_seed in config["evaluation_seeds"]:
                 seed = matched_seed("evaluation", track, sample_seed)
                 output = self.enhance(coarse, nfe, seed, config["solver"])
                 self.validation_totals[index, 0] += spectral_loss(audio, output).sum()
                 self.validation_totals[index, 1] += si_sdr(audio, output).sum()
+                if self.monitor_highbands:
+                    with torch.autocast(device_type=audio.device.type, enabled=False):
+                        estimate = self.codec.features(output.float() / scale).abs()
+                        self.validation_highbands[index] += self.highband_errors(
+                            estimate, reference_magnitude
+                        ).sum(0)
                 if batch_idx == 0 and nfe == config["checkpoint_nfe"] and sample_seed == config["evaluation_seeds"][0]:
                     self.log_audio(audio, coarse, output, "val", nfe)
 
@@ -323,6 +381,13 @@ class Postfilter(pl.LightningModule):
         if self.hparams.config.get("ablation_arm"):
             self.log("val/crop_slots", float(self.global_step * self.hparams.config["effective_batch"]))
         count = totals[0, 1] * len(config["evaluation_seeds"])
+        if self.monitor_highbands:
+            highbands = self.trainer.strategy.reduce(self.validation_highbands, reduce_op="sum")
+            for (low, high), error in zip(HIGHBANDS_HZ, highbands[0] / totals[0, 1]):
+                self.log(f"val/ndac_highband_{low}_{high}hz", error)
+            for nfe, per_band in zip(config["validation_nfe"], highbands[1:] / count):
+                for (low, high), error in zip(HIGHBANDS_HZ, per_band):
+                    self.log(f"val/highband_{low}_{high}hz_nfe{nfe}", error)
         for index, nfe in enumerate(config["validation_nfe"], start=1):
             spectral, sdr = totals[index] / count
             self.log(f"val/spectral_nfe{nfe}", spectral)
@@ -380,9 +445,10 @@ class Postfilter(pl.LightningModule):
             return torch.optim.Adam(self.network.parameters(), lr=1e-4)
         if self.jamendo:
             optimizer = torch.optim.AdamW(self.network.parameters(), lr=2e-4, weight_decay=1e-4)
-            if self.hparams.config.get("schedule") == "wsd":
+            schedule = self.hparams.config.get("schedule")
+            if schedule in {"wsd", "wsd-long"}:
                 batch = self.hparams.config["effective_batch"]
-                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: wsd_factor(step, batch))
+                scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: wsd_factor(step, batch, schedule))
                 return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer, T_max=self.hparams.config["max_epochs"], eta_min=1e-6

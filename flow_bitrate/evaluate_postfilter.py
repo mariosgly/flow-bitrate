@@ -136,7 +136,8 @@ def main():
         raise ValueError("Checkpoints must have distinct run labels")
     arm_settings = ({"backbone", "ema", "batch_size", "accumulate", "phase_loss", "phase_calibration", "tau_multiplier",
                      "width", "time_embedding_dim", "optimizer_recipe", "max_updates", "ablation_arm", "architecture",
-                     "schedule", "start_noise", "noise_calibration", "ema_decay", "effective_batch", "validate_every"}
+                     "schedule", "start_noise", "noise_calibration", "ema_decay", "effective_batch", "validate_every",
+                     "band_width", "highband_loss_weight"}
                     if jamendo else {"ema", "ema_decay"})
     expected_settings = {key: value for key, value in config.items() if key not in arm_settings}
     if jamendo:
@@ -177,6 +178,8 @@ def main():
             models[-1].update(batch_size_per_gpu=settings["batch_size"], accumulate=settings["accumulate"],
                               effective_batch_size=effective_batch, optimizer_recipe=model.optimizer_recipe,
                               architecture=architecture, start_noise=settings.get("start_noise", "original"),
+                              band_width=settings.get("band_width", 256) if architecture.startswith("band-") else None,
+                              highband_loss_weight=settings.get("highband_loss_weight", 0.0),
                               schedule=settings.get("schedule"), crop_slots=model.checkpoint_step * effective_batch,
                               cyfm_width=settings["width"] if cyfm else None,
                               cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if cyfm else None)

@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass, replace
 
 FIRST_CROPS = 192_000
+LONG_FIRST_CROPS = 1_536_000
 CACHE_LOOKAHEAD = 1024
 CALIBRATION_FILE = "start-noise.json"
 
@@ -18,6 +19,8 @@ class Arm:
     noise: str = "original"
     schedule: str = "wsd"
     batch: int = 64
+    band_width: int = 256
+    highband_loss_weight: float = 0.0
 
 
 REFERENCE = Arm("medium-disk")
@@ -57,6 +60,29 @@ ARMS = dict(enumerate((
             noise="jamendo-raw"),
 ), start=1))
 
+LONG_UNET = replace(ARMS[12], schedule="wsd-long")
+LONG_BAND_ORIGINAL = replace(ARMS[20], schedule="wsd-long")
+LONG_BAND_RAW = replace(ARMS[29], schedule="wsd-long")
+HIGHBAND_WEIGHT = 0.05
+
+ARMS.update({
+    30: LONG_UNET,
+    31: replace(LONG_UNET, name=ARMS[27].name, architecture="multiscale"),
+    32: replace(LONG_UNET, name=LONG_UNET.name + "-highband", highband_loss_weight=HIGHBAND_WEIGHT),
+    33: replace(LONG_UNET, name=ARMS[27].name + "-highband", architecture="multiscale",
+                highband_loss_weight=HIGHBAND_WEIGHT),
+    34: LONG_BAND_ORIGINAL,
+    35: replace(LONG_BAND_ORIGINAL, name=LONG_BAND_ORIGINAL.name + "-w320", band_width=320),
+    36: replace(LONG_BAND_ORIGINAL, name=LONG_BAND_ORIGINAL.name + "-highband", highband_loss_weight=HIGHBAND_WEIGHT),
+    37: replace(LONG_BAND_ORIGINAL, name=LONG_BAND_ORIGINAL.name + "-w320-highband", band_width=320,
+                highband_loss_weight=HIGHBAND_WEIGHT),
+    38: LONG_BAND_RAW,
+    39: replace(LONG_BAND_RAW, name=LONG_BAND_RAW.name + "-w320", band_width=320),
+    40: replace(LONG_BAND_RAW, name=LONG_BAND_RAW.name + "-highband", highband_loss_weight=HIGHBAND_WEIGHT),
+    41: replace(LONG_BAND_RAW, name=LONG_BAND_RAW.name + "-w320-highband", band_width=320,
+                highband_loss_weight=HIGHBAND_WEIGHT),
+})
+
 
 def real_crops(track_count, batch, updates):
     """Number of real sampler entries consumed, excluding the epoch-tail padding."""
@@ -64,10 +90,11 @@ def real_crops(track_count, batch, updates):
     return epochs * track_count + updates_in_epoch * batch
 
 
-def wsd_factor(step, effective_batch):
+def wsd_factor(step, effective_batch, schedule="wsd"):
+    warmup, decay_start, decay_end = (1_000, 32_000, 48_000) if schedule == "wsd-long" else (500, 10_000, 12_000)
     equivalent_step = step * effective_batch / 64
-    if equivalent_step < 500:
-        fraction = equivalent_step / 500
+    if equivalent_step < warmup:
+        fraction = equivalent_step / warmup
         return 0.05 + 0.95 * (1 - math.cos(math.pi * fraction)) / 2
-    fraction = min(1.0, max(0.0, (equivalent_step - 10_000) / 2_000))
+    fraction = min(1.0, max(0.0, (equivalent_step - decay_start) / (decay_end - decay_start)))
     return 0.05 + 0.95 * (1 + math.cos(math.pi * fraction)) / 2
