@@ -29,6 +29,12 @@ DEFAULT_ROOT = SCRATCH / "jamendo-scores"
 DEFAULT_CLAP = SCRATCH / "models" / "clap-laion-audio" / "630k-audioset-best.pt"
 PROTOCOL_VERSION = 1
 METRICS = ("si_sdr", "fwssnr", "logspec_mse")
+LOGSPEC_N_FFT = 1536
+LOGSPEC_BANDS_HZ = ((1000, 2000), (2000, 4000), (4000, 8000), (8000, 16000), (16000, 24000))
+
+
+def band_metric(low, high):
+    return f"logspec_mse_{low}_{high}hz"
 
 
 def digest(value):
@@ -125,13 +131,24 @@ def make_plan(args, root, plan_path):
     rows = read_manifest(manifest, dataset="jamendo")
     if file_hash(manifest) != manifest_sha:
         raise ValueError("Manifest changed while reading it")
-    split_rows = [row for row in rows if row["split"] == args.split]
-    dataset = JamendoCrops(split_rows, args.split, seed=0, seconds=10, per_domain=args.limit or len(split_rows))
-    if len(dataset) < 2:
+    cohort = None
+    if args.cohort_plan:
+        cohort = read_json(root / "plans" / args.cohort_plan / "plan.json")
+        split = cohort.get("split", "test")
+        if (cohort["manifest_sha256"] != manifest_sha or cohort["protocol"]["seconds"] != 10
+                or (args.split is not None and args.split != split)):
+            raise ValueError("The cohort plan must match the audited manifest, clip duration and split")
+        tracks = cohort["tracks"]
+    else:
+        split = args.split or "test"
+        split_rows = [row for row in rows if row["split"] == split]
+        tracks = JamendoCrops(split_rows, split, seed=0, seconds=10,
+                              per_domain=args.limit or len(split_rows)).rows
+    if len(tracks) < 2:
         raise ValueError("FAD needs at least two eligible ten-second excerpts")
-    if len({row["source_id"] for row in dataset.rows}) != len(dataset):
-        raise ValueError("The cohort needs unique track IDs")
-    for row in dataset.rows:
+    if len({row["source_id"] for row in tracks}) != len(tracks) or any(row["split"] != split for row in tracks):
+        raise ValueError("The cohort needs unique track IDs from the selected split")
+    for row in tracks:
         check_audio(row)
 
     models, pending = {}, []
@@ -195,19 +212,23 @@ def make_plan(args, root, plan_path):
     if file_hash(ndac) != codec_identity["ndac"]:
         raise ValueError("The configured NDAC weights differ from the training checkpoints")
     clap_sha, clap = snapshot(args.clap_weights.resolve(), root / "snapshots")
-    seeds = config["evaluation_seeds"]
+    seeds = cohort["seeds"] if cohort else config["evaluation_seeds"]
     if not seeds or len(set(seeds)) != len(seeds) or not all(isinstance(seed, int) for seed in seeds):
         raise ValueError("The evaluation config needs distinct integer noise seeds")
     protocol = dict(version=PROTOCOL_VERSION, seconds=10, sample_rate=SAMPLE_RATE,
                     codebooks=6, embedding="LAION CLAP HTSAT-tiny unfused, one embedding per clip",
                     clap_sha256=clap_sha)
+    if args.spectral_bands:
+        protocol["logspec_bands_hz"] = LOGSPEC_BANDS_HZ
     plan = dict(protocol=protocol, manifest_sha256=manifest_sha, codec=codec_identity,
                 codec_dir=config["checkpoints"], clap=clap.name, nfe=args.nfe, solver="midpoint",
-                split=args.split, seeds=seeds, tracks=dataset.rows, models=list(models.values()), pending=pending)
+                split=split, seeds=seeds, tracks=tracks, models=list(models.values()), pending=pending)
+    if args.cohort_plan:
+        plan["cohort_plan"] = args.cohort_plan
     if args.blend_weights is not None:
         plan["blend_weights"] = args.blend_weights
     write_json(plan_path, plan, immutable=True)
-    print(f"Plan {plan_path}: {len(models)} checkpoint versions, {len(dataset)} {args.split} clips, {len(pending)} pending")
+    print(f"Plan {plan_path}: {len(models)} checkpoint versions, {len(tracks)} {split} clips, {len(pending)} pending")
 
 
 def derive_plan(args, root, plan_path):
@@ -243,7 +264,7 @@ class Records:
 
 
 class Metrics:
-    def __init__(self, clap_path, device):
+    def __init__(self, clap_path, device, bands=()):
         from laion_clap import CLAP_Module
         from pysepm.qualityMeasures import fwSNRseg
 
@@ -251,7 +272,14 @@ class Metrics:
         self.clap = CLAP_Module(device=str(device), enable_fusion=False, amodel="HTSAT-tiny")
         self.clap.load_ckpt(str(clap_path), verbose=False)
         self.clap.eval()
-        self.spectrum = Spectrogram(n_fft=1536, hop_length=384, window_fn=torch.signal.windows.hann, power=2)
+        self.spectrum = Spectrogram(n_fft=LOGSPEC_N_FFT, hop_length=384, window_fn=torch.signal.windows.hann, power=2)
+        self.band_slices = {}
+        for low, high in bands:
+            first = math.ceil(low * LOGSPEC_N_FFT / SAMPLE_RATE)
+            stop = math.ceil(high * LOGSPEC_N_FFT / SAMPLE_RATE)
+            if high * 2 == SAMPLE_RATE:
+                stop += 1
+            self.band_slices[band_metric(low, high)] = slice(first, stop)
 
     def embed(self, audio):
         if audio.shape != (1, 1, 10 * SAMPLE_RATE) or not torch.isfinite(audio).all():
@@ -272,8 +300,11 @@ class Metrics:
             fwssnr = float(self.fwssnr(x.numpy(), y.numpy(), fs=SAMPLE_RATE, frameLen=0.03, overlap=0.75))
         log_x = 10 * self.spectrum(x).clamp_min(1e-8).log10()
         log_y = 10 * self.spectrum(y).clamp_min(1e-8).log10()
-        return dict(si_sdr=sdr.item(), fwssnr=fwssnr if math.isfinite(fwssnr) else None,
-                    logspec_mse=(log_x - log_y).square().mean().item(), embedding=self.embed(output))
+        spectral_error = (log_x - log_y).square()
+        result = dict(si_sdr=sdr.item(), fwssnr=fwssnr if math.isfinite(fwssnr) else None,
+                      logspec_mse=spectral_error.mean().item(), embedding=self.embed(output))
+        result.update({name: spectral_error[bins].mean().item() for name, bins in self.band_slices.items()})
+        return result
 
 
 @torch.inference_mode()
@@ -320,7 +351,8 @@ def score(args, root, plan, records):
                     audio, track = dataset[index]
                     original = audio[None]
                     if metrics is None:
-                        metrics = Metrics(root / "snapshots" / plan["clap"], device)
+                        metrics = Metrics(root / "snapshots" / plan["clap"], device,
+                                          plan["protocol"].get("logspec_bands_hz", ()))
                     clean = ("clean", 1.0)
                     if clean in missing:
                         write_json(paths[clean], {"embedding": metrics.embed(original)})
@@ -370,6 +402,7 @@ def score(args, root, plan, records):
 
 def report(args, plan, records, directory):
     tracks, seeds = plan["tracks"], plan["seeds"]
+    metric_names = METRICS + tuple(band_metric(low, high) for low, high in plan["protocol"].get("logspec_bands_hz", ()))
     blending = "blend_weights" in plan
     weights = plan.get("blend_weights", [1.0])
     methods = [(None, 0.0), *((model, weight) for model in plan["models"] for weight in weights)]
@@ -412,7 +445,7 @@ def report(args, plan, records, directory):
     for (model, weight), (label, jobs) in zip(methods, groups[1:]):
         method_seeds = seeds if model else [None]
         by_seed = {seed: [] for seed in method_seeds}
-        paired = {metric: [] for metric in METRICS}
+        paired = {metric: [] for metric in metric_names}
         nfe = plan["nfe"] if model else 0
         for track_index, row in enumerate(tracks):
             results = []
@@ -421,11 +454,11 @@ def report(args, plan, records, directory):
                 by_seed[seed].append(result["embedding"])
                 results.append(result)
                 detail = dict(method=label, nfe=nfe, seed=seed, track=row["source_id"],
-                              artist=row["group"], **{metric: result[metric] for metric in METRICS})
+                              artist=row["group"], **{metric: result[metric] for metric in metric_names})
                 if blending:
                     detail["blend_weight"] = weight
                 details.append(detail)
-            for metric in METRICS:
+            for metric in metric_names:
                 values = [result[metric] for result in results if result[metric] is not None]
                 if values:
                     paired[metric].append(float(np.mean(values)))
@@ -443,7 +476,7 @@ def report(args, plan, records, directory):
             writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-    artist_reports(directory, details, METRICS)
+    artist_reports(directory, details, metric_names)
     write_json(directory / "summary.json", dict(protocol=plan["protocol"], manifest_sha256=plan["manifest_sha256"],
                                                 split=plan.get("split", "test"), results=summary, pending=plan["pending"]))
     print(f"Reports saved in {directory}")
@@ -464,6 +497,8 @@ def main():
     parser.add_argument("--nfe", type=int, help="Inference budget, 1 for Euler or an even midpoint budget (default 6)")
     parser.add_argument("--split", choices=("val", "test"), help="Cohort to use when planning (default test)")
     parser.add_argument("--limit", type=int, help="Use a fixed subset per domain when planning")
+    parser.add_argument("--cohort-plan", help="Reuse the exact tracks, split and noise seeds of an existing plan")
+    parser.add_argument("--spectral-bands", action="store_true", help="Also score logSpecMSE in five bands above 1 kHz")
     budget = parser.add_mutually_exclusive_group()
     budget.add_argument("--require-update", type=int, help="Require this optimizer update for all checkpoints")
     budget.add_argument("--require-crops", type=int, help="Require this many scheduled crop slots for all checkpoints")
@@ -489,23 +524,28 @@ def main():
                 parser.error("--from-plan must be a folder name")
             if not args.arms or len(set(args.arms)) != len(args.arms) or args.blend_weights is None:
                 parser.error("Use distinct --arms and set --blend-weights with --from-plan")
-            if any(value is not None for value in (args.nfe, args.split, args.limit, args.require_update, args.require_crops)):
-                parser.error("--from-plan inherits the checkpoint budgets, cohort and NFE of the source plan")
+            if args.spectral_bands or any(value is not None for value in (
+                    args.nfe, args.split, args.limit, args.require_update, args.require_crops, args.cohort_plan)):
+                parser.error("--from-plan inherits the checkpoint budgets, cohort, NFE and metrics of the source plan")
             derive_plan(args, root, plan_path)
             return
         if args.arms is not None:
             parser.error("--arms requires --from-plan")
         args.nfe = 6 if args.nfe is None else args.nfe
-        args.split = args.split or "test"
+        if args.cohort_plan is not None:
+            if Path(args.cohort_plan).name != args.cohort_plan or args.cohort_plan in {"", ".", ".."}:
+                parser.error("--cohort-plan must be a folder name")
+            if args.limit is not None:
+                parser.error("--cohort-plan inherits the track count; omit --limit")
         if not args.checkpoints or args.nfe < 1 or (args.nfe != 1 and args.nfe % 2):
             parser.error("Pass checkpoints and either NFE 1 or a positive even NFE")
         if args.limit is not None and args.limit < 2:
             parser.error("--limit must be at least two")
         make_plan(args, root, plan_path)
     else:
-        if any(value is not None for value in (args.require_update, args.require_crops, args.from_plan,
-                                                args.arms, args.blend_weights)):
-            parser.error("Checkpoint budget guards and blend settings apply when creating a plan")
+        if args.spectral_bands or any(value is not None for value in (
+                args.require_update, args.require_crops, args.from_plan, args.arms, args.blend_weights, args.cohort_plan)):
+            parser.error("Checkpoint, blend, cohort and metric settings apply when creating a plan")
         plan = read_json(plan_path)
         if plan["protocol"]["version"] != PROTOCOL_VERSION:
             parser.error("This plan uses a different scoring protocol")
