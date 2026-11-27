@@ -153,7 +153,7 @@ def make_plan(args, root, plan_path):
 
     models, pending = {}, []
     codec_identity = None
-    for path in args.checkpoints:
+    for path in args.checkpoints or ():
         path = path.expanduser().resolve()
         source = path
         if path.is_dir():
@@ -206,6 +206,19 @@ def make_plan(args, root, plan_path):
                            phase_loss=settings.get("phase_loss", "unit"), tau_multiplier=settings.get("tau_multiplier"),
                            phase_weight_mean=settings.get("phase_calibration", {}).get("mean_q"))
         del saved
+    if args.released_flowdec:
+        source = Path(config["checkpoints"]) / "flowdec/flowdec_75m/step=800000.ckpt"
+        sha, frozen = snapshot(source, root / "snapshots")
+        saved = torch.load(frozen, map_location="cpu", weights_only=False)
+        if "_pl_ema_state_dict" not in saved or "flow_state" in saved:
+            raise ValueError(f"Expected the official FlowDec-75m checkpoint with its EMA weights: {source}")
+        models[sha] = dict(source=str(source), snapshot=frozen.name, sha256=sha, released_flowdec=True,
+                           method="Released FlowDec-75m EMA", step=saved.get("global_step"),
+                           backbone="flowdec", architecture="ncsnpp", geometry="cartesian", weights="ema")
+        del saved
+        if codec_identity is None:
+            codec_identity = (cohort["codec"] if cohort else
+                              FlowCodec(config["checkpoints"], load_backbone=False, configured_noise=True).identity)
     if not models:
         raise ValueError("No best checkpoints available yet")
     ndac = Path(config["checkpoints"]) / "ndac/ndac-75/800k/dac/weights.pth"
@@ -325,6 +338,7 @@ def score(args, root, plan, records):
               unit="record", mininterval=15) as progress:
         for method in [None, *plan["models"]]:
             model = None
+            released = bool(method and method.get("released_flowdec"))
             for index in assigned:
                 if time.monotonic() >= deadline:
                     print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
@@ -362,7 +376,10 @@ def score(args, root, plan, records):
                     if not missing:
                         continue
                     if model is None:
-                        if method:
+                        if released:
+                            codec = FlowCodec(plan["codec_dir"], flow_checkpoint=root / "snapshots" / method["snapshot"])
+                            model = codec.to(device)
+                        elif method:
                             model = Postfilter.load_from_checkpoint(
                                 root / "snapshots" / method["snapshot"], map_location="cpu"
                             ).eval().to(device)
@@ -370,9 +387,11 @@ def score(args, root, plan, records):
                         else:
                             codec = FlowCodec(plan["codec_dir"], load_backbone=False, configured_noise=True).to(device)
                             model = codec
-                        if codec.identity != plan["codec"]:
+                        if codec.identity["ndac"] != plan["codec"]["ndac"]:
+                            raise ValueError("The current NDAC weights differ from the plan")
+                        if not released and codec.identity != plan["codec"]:
                             raise ValueError("The current NDAC or FlowDec noise assets differ from the plan")
-                    if method:
+                    if method and not released:
                         coarse = model.coarse_audio(original.to(device))
                     else:
                         samples = original.shape[-1]
@@ -382,8 +401,18 @@ def score(args, root, plan, records):
                         if time.monotonic() >= deadline:
                             print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.", flush=True)
                             return
-                        output = model.enhance(coarse, plan["nfe"], matched_seed("evaluation", track, seed),
-                                               plan["solver"]) if method else coarse
+                        if method:
+                            nfe = plan["nfe"]
+                            noise_seed = matched_seed("evaluation", track, seed)
+                            solver = "euler" if nfe == 1 else plan["solver"]
+                            if released:
+                                steps = nfe // 2 if solver == "midpoint" else nfe
+                                output = model.enhance(coarse, seed=noise_seed, steps=steps,
+                                                       solver=solver, matched_noise=True)
+                            else:
+                                output = model.enhance(coarse, nfe, noise_seed, solver)
+                        else:
+                            output = coarse
                         for request in variants:
                             if time.monotonic() >= deadline:
                                 print(f"Time slice ended after saving {written} records. Resubmit this shard to continue.",
@@ -491,6 +520,7 @@ def main():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--checkpoints", type=Path, nargs="+", help="Checkpoint files or run directories containing best.ckpt or last.ckpt")
     source.add_argument("--from-plan", help="Reuse the frozen checkpoint versions, cohort, seeds and NFE of this plan")
+    parser.add_argument("--released-flowdec", action="store_true", help="Score the official FlowDec-75m EMA checkpoint")
     parser.add_argument("--arms", type=int, nargs="+", help="Select ablation arms from --from-plan")
     parser.add_argument("--blend-weights", type=float, nargs="+", help="Score NDAC + weight * (enhanced - NDAC)")
     parser.add_argument("--clap-weights", type=Path, default=DEFAULT_CLAP)
@@ -524,7 +554,7 @@ def main():
                 parser.error("--from-plan must be a folder name")
             if not args.arms or len(set(args.arms)) != len(args.arms) or args.blend_weights is None:
                 parser.error("Use distinct --arms and set --blend-weights with --from-plan")
-            if args.spectral_bands or any(value is not None for value in (
+            if args.released_flowdec or args.spectral_bands or any(value is not None for value in (
                     args.nfe, args.split, args.limit, args.require_update, args.require_crops, args.cohort_plan)):
                 parser.error("--from-plan inherits the checkpoint budgets, cohort, NFE and metrics of the source plan")
             derive_plan(args, root, plan_path)
@@ -537,13 +567,13 @@ def main():
                 parser.error("--cohort-plan must be a folder name")
             if args.limit is not None:
                 parser.error("--cohort-plan inherits the track count; omit --limit")
-        if not args.checkpoints or args.nfe < 1 or (args.nfe != 1 and args.nfe % 2):
-            parser.error("Pass checkpoints and either NFE 1 or a positive even NFE")
+        if not (args.checkpoints or args.released_flowdec) or args.nfe < 1 or (args.nfe != 1 and args.nfe % 2):
+            parser.error("Pass checkpoints or --released-flowdec, and either NFE 1 or a positive even NFE")
         if args.limit is not None and args.limit < 2:
             parser.error("--limit must be at least two")
         make_plan(args, root, plan_path)
     else:
-        if args.spectral_bands or any(value is not None for value in (
+        if args.released_flowdec or args.spectral_bands or any(value is not None for value in (
                 args.require_update, args.require_crops, args.from_plan, args.arms, args.blend_weights, args.cohort_plan)):
             parser.error("Checkpoint, blend, cohort and metric settings apply when creating a plan")
         plan = read_json(plan_path)

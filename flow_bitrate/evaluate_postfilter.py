@@ -26,21 +26,10 @@ from .train_postfilter import AudioCrops, JamendoCrops
 
 
 @torch.inference_mode()
-def released_enhance(codec, coarse, nfe, seed, solver):
-    condition, _, (scale, frames, length) = codec.preprocess(coarse)
-    generator = torch.Generator(device=coarse.device).manual_seed(seed)
-    noise = torch.randn(condition.shape, dtype=condition.dtype, device=coarse.device, generator=generator)
-    state = condition + codec.sigma * noise
-    midpoint = solver == "midpoint" and nfe != 1
-    steps = nfe // 2 if midpoint else nfe
-    dt = 1.0 / steps
-    for index in range(steps):
-        t = torch.full((len(coarse),), index * dt, device=coarse.device)
-        velocity = codec.velocity(state, condition, t)
-        if midpoint:
-            velocity = codec.velocity(state + 0.5 * dt * velocity, condition, t + 0.5 * dt)
-        state = state + dt * velocity
-    return codec.features.invert(state[..., :frames], orig_length=length) * scale
+def released_enhance(codec, coarse, nfe, seed, solver, *, matched_noise=False):
+    solver = "euler" if nfe == 1 else solver
+    steps = nfe // 2 if solver == "midpoint" else nfe
+    return codec.enhance(coarse, seed=seed, steps=steps, solver=solver, matched_noise=matched_noise)
 
 
 def save_json(path, value):
@@ -74,6 +63,8 @@ def main():
     if args.score_plan is not None:
         plan_path = args.score_plan.resolve()
         score_plan = json.loads(plan_path.read_text())
+        if any(model.get("released_flowdec") for model in score_plan["models"]):
+            parser.error("For audio with released FlowDec, pass local postfilter checkpoints and --released")
         snapshots = plan_path.parent.parent.parent / "snapshots"
         checkpoints = [snapshots / model["snapshot"] for model in score_plan["models"]]
         labels = [f"{Path(model['source']).parent.name}-{model['sha256'][:12]}" for model in score_plan["models"]]
@@ -107,8 +98,6 @@ def main():
         parser.error("--listening-tracks requires two Jamendo checkpoints and a nonnegative count")
     if args.cohort_seed is not None and not jamendo:
         parser.error("--cohort-seed is for Jamendo")
-    if jamendo and args.released:
-        parser.error("Pass the scratch-trained FlowDec checkpoint for the Jamendo comparison")
     if file_hash(config["manifest"]) != expected_manifest:
         raise ValueError("The training manifest changed; restore its original split definitions")
     rows = score_plan["tracks"] if score_plan is not None else read_manifest(config["manifest"], dataset=config.get("dataset"))
@@ -184,8 +173,11 @@ def main():
                               cyfm_width=settings["width"] if cyfm else None,
                               cyfm_time_width=settings.get("time_embedding_dim", 4 * settings["width"]) if cyfm else None)
         released = FlowCodec(config["checkpoints"]).eval().cuda() if args.released and model_index == 0 else None
-        if released is not None and released.identity != model.codec.identity:
-            raise ValueError("Released reference must use the same NDAC and feature/noise source")
+        if released is not None:
+            if released.identity["ndac"] != model.codec.identity["ndac"]:
+                raise ValueError("Released reference must use the same NDAC weights")
+            if not jamendo and released.identity != model.codec.identity:
+                raise ValueError("Released reference must use the same feature/noise source")
         examples = set()
         for index, row in enumerate(data.rows):
             stat = Path(row["path"]).stat()
@@ -199,7 +191,8 @@ def main():
             examples.add(domain)
             identity = {"checkpoint": checkpoint_hash, "model": label, "index": index, "source": row,
                         "source_size": stat.st_size, "source_mtime": stat.st_mtime_ns,
-                        "split": args.split, "data_seed": data_seed, "seconds": duration, "released": released is not None,
+                        "split": args.split, "data_seed": data_seed, "seconds": duration,
+                        "released": released.identity["flow"] if released is not None else False,
                         "whole_excerpt": jamendo, "include_ndac": model_index == 0, "solver": solver,
                         "nfe": budgets, "noise_seeds": noise_seeds}
             key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
@@ -247,7 +240,7 @@ def main():
             methods = [(label, model.enhance)]
             if released is not None:
                 methods.append(("released_flowdec", lambda coarse, nfe, seed, solver:
-                                released_enhance(released, coarse, nfe, seed, solver)))
+                                released_enhance(released, coarse, nfe, seed, solver, matched_noise=jamendo)))
             for method_name, enhance in methods:
                 # Warm up on each source before collecting decoder timings.
                 enhance(coarse_blocks[0], 1, 0, solver)

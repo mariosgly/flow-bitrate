@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import yaml
 from torch import nn
 
+from .phase_geometry import matched_draw
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRATCH = Path("/scratch/mg8253/flow-bitrate")
 UPSTREAM = ROOT / "external/FlowDec"
@@ -206,17 +208,24 @@ class FlowCodec(nn.Module):
         return torch.stack(measurements, dim=-1)  # [B, 10], five backbone calls per rate
 
     @torch.no_grad()
-    def enhance(self, coarse, seed=0, steps=3):
+    def enhance(self, coarse, seed=0, steps=3, *, solver="midpoint", matched_noise=False):
+        if steps < 1 or solver not in {"euler", "midpoint"}:
+            raise ValueError("Use positive solver steps and euler or midpoint")
         condition, _, (scale, frames, length) = self.preprocess(coarse)
-        generator = torch.Generator(device=condition.device).manual_seed(seed)
-        noise = torch.randn(condition.shape, dtype=condition.dtype, device=condition.device, generator=generator)
-        state = condition + self.sigma * noise
-        # Same fixed-step midpoint rule as the paper, without torchdyn's import tree.
+        if matched_noise:
+            state, _ = matched_draw(condition, self.sigma, [seed] * len(coarse))
+        else:
+            generator = torch.Generator(device=condition.device).manual_seed(seed)
+            noise = torch.randn(condition.shape, dtype=condition.dtype, device=condition.device, generator=generator)
+            state = condition + self.sigma * noise
+        # Fixed-step integration, without torchdyn's import tree.
         dt = 1.0 / steps
         for index in range(steps):
             t = torch.tensor(index * dt, device=state.device)
-            first = self.velocity(state, condition, t)
-            state = state + dt * self.velocity(state + 0.5 * dt * first, condition, t + 0.5 * dt)
+            velocity = self.velocity(state, condition, t)
+            if solver == "midpoint":
+                velocity = self.velocity(state + 0.5 * dt * velocity, condition, t + 0.5 * dt)
+            state = state + dt * velocity
         waveform = self.features.invert(state[..., :frames], orig_length=length) * scale
         if not torch.isfinite(waveform).all():
             raise FloatingPointError("Non-finite FlowDec reconstruction")
